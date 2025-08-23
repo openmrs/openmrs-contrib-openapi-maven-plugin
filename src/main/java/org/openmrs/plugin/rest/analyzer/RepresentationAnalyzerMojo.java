@@ -68,11 +68,9 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         log.debug("Project: {}", project.getName());
         log.debug("Output directory: {}", getOutputDirectory());
         
-        // Prepare configuration
         prepareScanPackages();
         prepareOutputDirectory();
         
-        // Execute single-version generation
         try {
             log.info("Generating OpenAPI specification for OpenMRS version: {}", openmrsVersion);
             

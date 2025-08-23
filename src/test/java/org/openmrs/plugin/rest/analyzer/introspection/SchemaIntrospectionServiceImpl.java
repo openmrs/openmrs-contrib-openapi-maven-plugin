@@ -236,14 +236,12 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 		log.debug("Handler class: {}", handler.getClass().getSimpleName());
 		log.debug("Introspected properties contains '{}': {}", propertyName, introspectedProperties.containsKey(propertyName));
 		
-		// Strategy 1: Use introspection results (most accurate)
 		if (introspectedProperties.containsKey(propertyName)) {
 			String introspectedType = introspectedProperties.get(propertyName);
 			log.debug("STRATEGY 1 SUCCESS - Found introspected type for '{}': {}", propertyName, introspectedType);
 			return introspectedType;
 		}
 		
-		// Strategy 2: Analyze representation property metadata
 		String representationType = resolveFromRepresentationMetadata(propertyName, property, handler);
 		if (representationType != null) {
 			log.debug("STRATEGY 2 RESULT - Resolved type from representation metadata for '{}': {}", propertyName, representationType);
@@ -255,7 +253,6 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 			}
 		}
 		
-		// Strategy 3: Reflection on delegate class properties
 		log.debug("STRATEGY 3 - Attempting direct reflection on delegate class...");
 		String reflectedType = reflectPropertyType(propertyName, handler);
 		if (reflectedType != null) {
@@ -263,7 +260,6 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 			return reflectedType;
 		}
 		
-		// Strategy 4: Resource method resolution
 		log.debug("STRATEGY 4 - Attempting resource method resolution...");
 		String resourceMethodType = resolveFromResourceMethods(propertyName, handler);
 		if (resourceMethodType != null) {
@@ -271,7 +267,6 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 			return resourceMethodType;
 		}
 		
-		// Strategy 5: Intelligent inference from property names
 		log.debug("STRATEGY 5 - All strategies failed, using conservative inference...");
 		String inferredType = inferTypeFromPropertyName(propertyName);
 		log.debug("FINAL RESULT - Using conservative inference for '{}': {}", propertyName, inferredType);
