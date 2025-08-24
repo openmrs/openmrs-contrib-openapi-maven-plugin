@@ -15,8 +15,11 @@ import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -187,9 +190,24 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 	 * @param type The type to get a name for
 	 * @return A user-friendly type name string
 	 */
+	/**
+	 * Enhanced type name resolution that preserves collection type accuracy.
+	 * Properly handles Set vs List distinctions and generic type parameters.
+	 */
 	private String getTypeName(Type type) {
 		if (type instanceof Class) {
-			return ((Class<?>) type).getSimpleName();
+			Class<?> clazz = (Class<?>) type;
+			
+			// Preserve collection interface names for accuracy
+			if (Set.class.isAssignableFrom(clazz)) {
+				return "Set<Object>"; // Default when no generic info available
+			} else if (List.class.isAssignableFrom(clazz)) {
+				return "List<Object>"; // Default when no generic info available
+			} else if (Collection.class.isAssignableFrom(clazz)) {
+				return "Collection<Object>"; // Default when no generic info available
+			}
+			
+			return clazz.getSimpleName();
 		} else if (type instanceof ParameterizedType) {
 			ParameterizedType paramType = (ParameterizedType) type;
 			Type rawType = paramType.getRawType();
@@ -197,7 +215,18 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 			
 			StringBuilder sb = new StringBuilder();
 			if (rawType instanceof Class) {
-				sb.append(((Class<?>) rawType).getSimpleName());
+				Class<?> rawClass = (Class<?>) rawType;
+				
+				// Use proper collection interface names
+				if (Set.class.isAssignableFrom(rawClass)) {
+					sb.append("Set");
+				} else if (List.class.isAssignableFrom(rawClass)) {
+					sb.append("List");
+				} else if (Collection.class.isAssignableFrom(rawClass)) {
+					sb.append("Collection");
+				} else {
+					sb.append(rawClass.getSimpleName());
+				}
 			} else {
 				sb.append(rawType.toString());
 			}
@@ -210,6 +239,9 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 					}
 					if (typeArgs[i] instanceof Class) {
 						sb.append(((Class<?>) typeArgs[i]).getSimpleName());
+					} else if (typeArgs[i] instanceof ParameterizedType) {
+						// Recursively handle nested generic types
+						sb.append(getTypeName(typeArgs[i]));
 					} else {
 						sb.append(typeArgs[i].toString());
 					}
@@ -268,7 +300,7 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 		}
 		
 		log.debug("STRATEGY 5 - All strategies failed, using conservative inference...");
-		String inferredType = inferTypeFromPropertyName(propertyName);
+		String inferredType = inferTypeFromPropertyName(propertyName, handler);
 		log.debug("FINAL RESULT - Using conservative inference for '{}': {}", propertyName, inferredType);
 		log.debug("=== TYPE RESOLUTION COMPLETE FOR: {} -> {} ===", propertyName, inferredType);
 		return inferredType;
@@ -415,12 +447,6 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 			return reflectedType;
 		}
 		
-		String commonClassType = reflectFromCommonOpenMRSClasses(propertyName);
-		if (commonClassType != null) {
-			log.debug("Found type from common OpenMRS classes for '{}': {}", propertyName, commonClassType);
-			return commonClassType;
-		}
-		
 		String safeType = resolveSafePatterns(propertyName);
 		log.debug("Using safe pattern fallback for '{}': {}", propertyName, safeType);
 		return safeType;
@@ -472,96 +498,62 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 	
 	/**
 	 * Uses comprehensive reflection strategies to determine accurate property types.
+	 * PropertyGetter annotation scanning gets priority to ensure accurate type resolution.
 	 */
-	private String inferTypeFromPropertyName(String propertyName) {
+	private String inferTypeFromPropertyName(String propertyName, DelegatingResourceHandler<?> handler) {
 		if (propertyName == null) return "String";
 		
-		String reflectedType = reflectFromCommonOpenMRSClasses(propertyName);
-		if (reflectedType != null) {
-			log.debug("Found type via reflection on common classes for '{}': {}", propertyName, reflectedType);
-			return reflectedType;
-		}
-		
-		String annotationBasedType = resolveFromPropertyGetterAnnotations(propertyName);
+		// STRATEGY 1: Use actual PropertyGetter annotation scanning first - highest accuracy
+		String annotationBasedType = resolveFromActualPropertyGetterAnnotations(propertyName, handler);
 		if (annotationBasedType != null) {
 			log.debug("Found type via PropertyGetter annotations for '{}': {}", propertyName, annotationBasedType);
 			return annotationBasedType;
 		}
 		
+		// STRATEGY 2: Safe pattern matching for universal OpenMRS properties only
 		String safePatternType = resolveSafePatterns(propertyName);
 		log.debug("Using safe pattern type for '{}': {}", propertyName, safePatternType);
 		return safePatternType;
 	}
 	
 	/**
-	 * Reflects on common OpenMRS base classes to find property types
+	 * Scans the actual resource class for PropertyGetter annotations to resolve property types.
+	 * This replaces the previous hardcoded approach with dynamic annotation scanning.
 	 */
-	private String reflectFromCommonOpenMRSClasses(String propertyName) {
-		Class<?>[] commonBaseClasses = {
-			tryLoadClass("org.openmrs.BaseOpenmrsObject"),
-			tryLoadClass("org.openmrs.BaseOpenmrsMetadata"), 
-			tryLoadClass("org.openmrs.BaseOpenmrsData"),
-			tryLoadClass("org.openmrs.Person"),
-			tryLoadClass("org.openmrs.User"),
-			tryLoadClass("org.openmrs.Patient"),
-			tryLoadClass("org.openmrs.Encounter"),
-			tryLoadClass("org.openmrs.Obs"),
-			tryLoadClass("org.openmrs.Concept"),
-			tryLoadClass("org.openmrs.Location"),
-			tryLoadClass("org.openmrs.Provider")
-		};
-		
-		for (Class<?> baseClass : commonBaseClasses) {
-			if (baseClass == null) continue;
-			
-			try {
-				PropertyDescriptor[] descriptors = BeanUtils.getPropertyDescriptors(baseClass);
-				for (PropertyDescriptor descriptor : descriptors) {
-					if (descriptor.getName().equals(propertyName) && descriptor.getReadMethod() != null) {
-						Type propertyType = descriptor.getReadMethod().getGenericReturnType();
-						return getTypeName(propertyType);
-					}
-				}
-			} catch (Exception e) {
-				log.debug("Error reflecting on class {}: {}", baseClass.getName(), e.getMessage());
-			}
+	private String resolveFromActualPropertyGetterAnnotations(String propertyName, DelegatingResourceHandler<?> handler) {
+		if (handler == null) {
+			return null;
 		}
 		
-		return null;
-	}
-	
-	/**
-	 * Safely loads a class by name, returning null if not found
-	 */
-	private Class<?> tryLoadClass(String className) {
 		try {
-			return Class.forName(className);
-		} catch (ClassNotFoundException e) {
-			log.debug("Class not found: {}", className);
+			Class<?> resourceClass = handler.getClass();
+			Map<String, String> annotatedProperties = new HashMap<>();
+			
+			// Reuse the existing discoverAnnotatedProperties method
+			discoverAnnotatedProperties(resourceClass, annotatedProperties);
+			
+			// Check if our property was found
+			String resolvedType = annotatedProperties.get(propertyName);
+			if (resolvedType != null) {
+				log.debug("Found property '{}' with type '{}' via PropertyGetter annotation scanning", propertyName, resolvedType);
+				return resolvedType;
+			}
+			
+			log.debug("Property '{}' not found in PropertyGetter annotations for class {}", propertyName, resourceClass.getSimpleName());
+			return null;
+			
+		} catch (Exception e) {
+			log.warn("Failed to scan PropertyGetter annotations for property '{}': {}", propertyName, e.getMessage());
 			return null;
 		}
 	}
 	
 	/**
-	 * Attempts to resolve property types from PropertyGetter annotations on resource classes
-	 */
-	private String resolveFromPropertyGetterAnnotations(String propertyName) {
-		switch (propertyName) {
-			case "display":
-				return "String";
-			case "auditInfo":
-				return "SimpleObject";
-			case "links":
-				return "List<Link>";
-			default:
-				return null;
-		}
-	}
-	
-	/**
-	 * Uses only very safe, unambiguous pattern matching
+	 * Uses only very safe, unambiguous pattern matching for basic OpenMRS properties.
+	 * Removed List<Object> fallback and hardcoded collection patterns that prevent proper type discovery.
 	 */
 	private String resolveSafePatterns(String propertyName) {
+		// Safe individual property patterns - these are consistent across OpenMRS
 		if (propertyName.equals("id")) {
 			return "Integer";
 		} else if (propertyName.equals("uuid")) {
@@ -575,17 +567,8 @@ public class SchemaIntrospectionServiceImpl implements SchemaIntrospectionServic
 			return "Date";
 		}
 		
-		if (propertyName.endsWith("s") && propertyName.length() > 3) {
-			if (propertyName.equals("roles")) return "List<Role>";
-			if (propertyName.equals("privileges")) return "List<Privilege>";
-			if (propertyName.equals("names")) return "List<PersonName>";
-			if (propertyName.equals("addresses")) return "List<PersonAddress>";
-			if (propertyName.equals("identifiers")) return "List<PatientIdentifier>";
-			if (propertyName.equals("attributes")) return "List<PersonAttribute>";
-			
-			return "List<Object>";
-		}
-		
+		// No generic fallbacks - let PropertyGetter scanning or reflection handle collections
+		// Ultimate fallback only for truly unknown properties
 		return "String";
 	}
 }

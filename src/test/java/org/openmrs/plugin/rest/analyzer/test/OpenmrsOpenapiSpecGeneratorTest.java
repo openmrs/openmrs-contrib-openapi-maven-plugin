@@ -735,7 +735,68 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
         return schema;
     }
     
-    private Schema<?> mapToSwaggerSchema(String javaType, Components components, String representationHint, boolean isArrayItem) {
+    /**
+     * Type mapping registries for robust type detection.
+     * Phase 1 Enhancement: Replace fragile .contains() logic with exact type matching.
+     */
+    private static final Set<String> STRING_TYPES = new HashSet<>(Arrays.asList(
+        "string", "java.lang.string", "charsequence", "java.lang.charsequence"
+    ));
+    
+    private static final Set<String> INTEGER_TYPES = new HashSet<>(Arrays.asList(
+        "int", "integer", "java.lang.integer", "short", "java.lang.short", "byte", "java.lang.byte"
+    ));
+    
+    private static final Set<String> LONG_TYPES = new HashSet<>(Arrays.asList(
+        "long", "java.lang.long"
+    ));
+    
+    private static final Set<String> NUMBER_TYPES = new HashSet<>(Arrays.asList(
+        "double", "java.lang.double", "float", "java.lang.float", "number", 
+        "bigdecimal", "java.math.bigdecimal", "biginteger", "java.math.biginteger"
+    ));
+    
+    private static final Set<String> BOOLEAN_TYPES = new HashSet<>(Arrays.asList(
+        "boolean", "java.lang.boolean"
+    ));
+    
+    private static final Set<String> DATE_TIME_TYPES = new HashSet<>(Arrays.asList(
+        "date", "java.util.date", "datetime", "timestamp", "time", "localdate", 
+        "localdatetime", "localtime", "zoneddatetime", "instant", "calendar",
+        "java.time.localdate", "java.time.localdatetime", "java.time.localtime",
+        "java.time.zoneddatetime", "java.time.instant", "java.util.calendar"
+    ));
+    
+    /**
+     * Phase 1 Enhancement: Type mapping registry for configurable schema creation.
+     * Maps type categories to schema factory functions for extensibility.
+     */
+    private static final Map<String, String> TYPE_CATEGORY_MAPPING = new HashMap<>();
+    
+    static {
+        // Initialize type category mappings for better error reporting and debugging
+        for (String type : STRING_TYPES) {
+            TYPE_CATEGORY_MAPPING.put(type, "STRING");
+        }
+        for (String type : INTEGER_TYPES) {
+            TYPE_CATEGORY_MAPPING.put(type, "INTEGER");
+        }
+        for (String type : LONG_TYPES) {
+            TYPE_CATEGORY_MAPPING.put(type, "LONG");
+        }
+        for (String type : NUMBER_TYPES) {
+            TYPE_CATEGORY_MAPPING.put(type, "NUMBER");
+        }
+        for (String type : BOOLEAN_TYPES) {
+            TYPE_CATEGORY_MAPPING.put(type, "BOOLEAN");
+        }
+        for (String type : DATE_TIME_TYPES) {
+            TYPE_CATEGORY_MAPPING.put(type, "DATE_TIME");
+        }
+    }
+
+    // Phase 1 Enhancement: Made package-private for testing
+    Schema<?> mapToSwaggerSchema(String javaType, Components components, String representationHint, boolean isArrayItem) {
         if (javaType == null) return new StringSchema();
         
         if (isCollectionType(javaType)) {
@@ -745,21 +806,29 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
         }
         
         String cleanType = SchemaNameGenerator.cleanTypeString(javaType);
-        String lowerType = cleanType.toLowerCase();
-        //TODO: Remove usage of .contains() and make it robust
-        if (lowerType.equals("string") || lowerType.contains("string")) {
+        String normalizedType = normalizeTypeName(cleanType);
+        
+        // Phase 1 Enhancement: Robust type detection using predefined registries
+        if (STRING_TYPES.contains(normalizedType)) {
+            log.debug("Mapped type '{}' -> StringSchema (category: STRING)", javaType);
             return new StringSchema();
-        } else if (lowerType.equals("integer") || lowerType.equals("int") || lowerType.contains("int")) {
+        } else if (INTEGER_TYPES.contains(normalizedType)) {
+            log.debug("Mapped type '{}' -> IntegerSchema (category: INTEGER)", javaType);
             return new IntegerSchema();
-        } else if (lowerType.equals("long") || lowerType.contains("long")) {
+        } else if (LONG_TYPES.contains(normalizedType)) {
+            log.debug("Mapped type '{}' -> IntegerSchema[int64] (category: LONG)", javaType);
             return new IntegerSchema().format("int64");
-        } else if (lowerType.equals("double") || lowerType.equals("float") || lowerType.equals("number") || lowerType.contains("double") || lowerType.contains("float")) {
+        } else if (NUMBER_TYPES.contains(normalizedType)) {
+            log.debug("Mapped type '{}' -> NumberSchema (category: NUMBER)", javaType);
             return new NumberSchema();
-        } else if (lowerType.equals("boolean") || lowerType.contains("boolean")) {
+        } else if (BOOLEAN_TYPES.contains(normalizedType)) {
+            log.debug("Mapped type '{}' -> BooleanSchema (category: BOOLEAN)", javaType);
             return new BooleanSchema();
-        } else if (lowerType.equals("date") || lowerType.contains("date") || lowerType.contains("time")) {
+        } else if (DATE_TIME_TYPES.contains(normalizedType)) {
+            log.debug("Mapped type '{}' -> StringSchema[date-time] (category: DATE_TIME)", javaType);
             return new StringSchema().format("date-time");
         } else if (isKnownNestedType(cleanType)) {
+            log.debug("Mapped type '{}' -> NestedType (sub-resource)", javaType);
             if (isArrayItem) {
                 return createNestedTypeDescription(cleanType, representationHint, isArrayItem);
             } else {
@@ -769,12 +838,87 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
             }
         } else if (isOpenMRSDomainType(cleanType)) {
             String refName = SchemaNameGenerator.schemaNameFromPropertyType(javaType, representationHint);
+            log.debug("Mapped type '{}' -> $ref[{}] (OpenMRS domain type)", javaType, refName);
             return new Schema<>().$ref("#/components/schemas/" + refName);
-        } else if (lowerType.startsWith("object (from")) {
+        } else if (normalizedType.startsWith("object (from")) {
+            log.debug("Mapped type '{}' -> ObjectSchema (runtime-determined)", javaType);
             return new ObjectSchema().description("Type determined from " + javaType);
         } else {
-            return new ObjectSchema().description("Complex type: " + javaType);
+            // Enhanced fallback with better error handling and type category reporting
+            String typeCategory = TYPE_CATEGORY_MAPPING.get(normalizedType);
+            if (typeCategory != null) {
+                log.warn("Type '{}' recognized as {} but fell through to fallback - possible mapping issue", javaType, typeCategory);
+            } else {
+                log.debug("Unknown type '{}' (normalized: '{}') mapped to ObjectSchema fallback", javaType, normalizedType);
+            }
+            return createFallbackSchema(javaType, normalizedType);
         }
+    }
+    
+    /**
+     * Phase 1 Enhancement: Normalize type names for consistent matching.
+     * Handles various type name formats and edge cases.
+     */
+    private String normalizeTypeName(String typeName) {
+        if (typeName == null) return "";
+        
+        String normalized = typeName.toLowerCase().trim();
+        
+        // Handle array notation: String[] -> string
+        if (normalized.endsWith("[]")) {
+            normalized = normalized.substring(0, normalized.length() - 2);
+        }
+        
+        // Handle generic parameters: List<String> is handled elsewhere, but clean simple cases
+        int genericStart = normalized.indexOf('<');
+        if (genericStart > 0) {
+            normalized = normalized.substring(0, genericStart);
+        }
+        
+        // Remove common prefixes for cleaner matching
+        if (normalized.startsWith("java.lang.")) {
+            String withoutPrefix = normalized.substring("java.lang.".length());
+            // Only use shortened form for common types to avoid conflicts
+            Set<String> commonTypes = new HashSet<>(Arrays.asList(
+                "string", "integer", "long", "double", "float", "boolean", "short", "byte"
+            ));
+            if (commonTypes.contains(withoutPrefix)) {
+                normalized = withoutPrefix;
+            }
+        }
+        
+        return normalized;
+    }
+    
+    /**
+     * Phase 1 Enhancement: Creates a fallback schema for unknown types with enhanced diagnostics.
+     * Provides better error reporting and potential recovery strategies.
+     */
+    private Schema<?> createFallbackSchema(String originalType, String normalizedType) {
+        ObjectSchema schema = new ObjectSchema();
+        
+        // Provide detailed description for debugging
+        StringBuilder description = new StringBuilder("Complex type: ").append(originalType);
+        
+        if (!originalType.equals(normalizedType)) {
+            description.append(" (normalized: ").append(normalizedType).append(")");
+        }
+        
+        // Add hints for common issues
+        if (normalizedType.contains("list") || normalizedType.contains("set") || normalizedType.contains("collection")) {
+            description.append(" - Note: This appears to be a collection type but wasn't detected by isCollectionType()");
+        } else if (normalizedType.contains(".")) {
+            description.append(" - Note: This appears to be a fully qualified class name");
+        } else if (normalizedType.length() > 50) {
+            description.append(" - Note: This type name is unusually long, possibly indicating a complex generic type");
+        }
+        
+        schema.setDescription(description.toString());
+        
+        // Add example to help with debugging
+        schema.setExample("Value of type " + originalType);
+        
+        return schema;
     }
     
     private PathItem createPathItem(String resourceType, Map<String, Schema<?>> representationSchemas) {
