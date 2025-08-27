@@ -322,7 +322,7 @@ public class OpenmrsOpenapiSpecGeneratorTest extends BaseModuleWebContextSensiti
             }
             
             String resourceName = annotation.name();
-            String resourcePath = "/ws/rest/" + resourceName + "/{uuid}";
+            String resourcePath = "/ws/rest/" + RestConstants.VERSION_1 + "/" + resourceName + "/{uuid}";
             
             log.info("Processing resource: {} ({})", resourceName, handler.getClass().getSimpleName());
             
