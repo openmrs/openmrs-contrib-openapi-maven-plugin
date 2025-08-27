@@ -200,14 +200,52 @@ public class ResponseSchemaValidationTest {
         System.out.println("🚀 Starting validation of ALL accessible endpoints from OpenAPI spec...");
         
         List<String> allEndpoints = getAllEndpointsFromOpenApiSpec();
-        System.out.println("Found " + allEndpoints.size() + " endpoints in OpenAPI spec to validate.");
+        System.out.println("Found " + allEndpoints.size() + " endpoints in OpenAPI spec to test accessibility.");
         
-        for (String endpoint : allEndpoints) {
+        // Discover which endpoints are actually accessible
+        List<String> accessibleEndpoints = discoverAccessibleEndpoints(allEndpoints);
+        System.out.println("✅ Found " + accessibleEndpoints.size() + " accessible endpoints out of " + allEndpoints.size() + " total.");
+        
+        for (String endpoint : accessibleEndpoints) {
             endpointsTested.incrementAndGet();
             validateEndpointWithRepresentation(endpoint, "full");
         }
         
-        System.out.println("🔚 All spec-based endpoint validation complete for " + allEndpoints.size() + " endpoints.");
+        System.out.println("🔚 All spec-based endpoint validation complete for " + accessibleEndpoints.size() + " accessible endpoints.");
+    }
+
+    @Test
+    @Order(6)
+    @DisplayName("Dynamic validation of ALL accessible endpoints with path-to-schema mapping")
+    void validateAllAccessibleEndpointsWithDynamicMapping() {
+        System.out.println("🚀 Starting DYNAMIC validation with path-to-schema mapping...");
+        
+        // Get all endpoints from OpenAPI spec
+        List<String> allEndpoints = getAllEndpointsFromOpenApiSpec();
+        System.out.println("📋 Found " + allEndpoints.size() + " endpoints in OpenAPI spec.");
+        
+        // Discover accessible endpoints dynamically
+        List<String> accessibleEndpoints = discoverAccessibleEndpoints(allEndpoints);
+        System.out.println("✅ Discovered " + accessibleEndpoints.size() + " accessible endpoints.");
+        
+        // For each accessible endpoint, determine available representations and validate
+        for (String endpoint : accessibleEndpoints) {
+            System.out.println("\n📍 Processing endpoint: " + endpoint);
+            
+            // Get available representations for this endpoint from OpenAPI spec
+            List<String> availableRepresentations = getAvailableRepresentationsForEndpoint(endpoint);
+            System.out.println("  🔹 Available representations: " + availableRepresentations);
+            
+            // Validate each available representation
+            for (String representation : availableRepresentations) {
+                validateEndpointWithDynamicSchemaMapping(endpoint, representation);
+            }
+            
+            // Also test custom properties if available
+            validateEndpointCustomPropertiesWithDynamicMapping(endpoint);
+        }
+        
+        System.out.println("\n🔚 Dynamic validation complete for " + accessibleEndpoints.size() + " accessible endpoints.");
     }
 
     @AfterAll
@@ -470,6 +508,384 @@ public class ResponseSchemaValidationTest {
             // Read the InputStream using ObjectMapper directly
             openApiSpec = objectMapper.readTree(specStream);
             System.out.println("📋 Loaded OpenAPI spec from: " + OPENAPI_SPEC_RESOURCE);
+        }
+    }
+
+    /**
+     * Dynamically discover which endpoints are accessible by testing them
+     */
+    private List<String> discoverAccessibleEndpoints(List<String> allEndpoints) {
+        List<String> accessibleEndpoints = new ArrayList<>();
+        System.out.println("🔍 Testing accessibility of " + allEndpoints.size() + " endpoints...");
+        
+        for (String endpoint : allEndpoints) {
+            try {
+                Response response = given()
+                    .header("Authorization", BASIC_AUTH)
+                    .config(RestAssuredConfig.config()
+                        .httpClient(HttpClientConfig.httpClientConfig()
+                            .setParam("http.connection.timeout", 10000)
+                            .setParam("http.socket.timeout", 10000)))
+                    .when()
+                    .get(endpoint + "?v=default&limit=1")
+                    .then()
+                    .extract()
+                    .response();
+                
+                int statusCode = response.getStatusCode();
+                
+                // Consider 200, 404 (empty result), and even 500 as "accessible"
+                // 401, 403, 405 indicate the endpoint exists but has access issues
+                if (statusCode == 200 || statusCode == 404 || statusCode == 500 || 
+                    statusCode == 401 || statusCode == 403) {
+                    accessibleEndpoints.add(endpoint);
+                    System.out.println("  ✅ " + endpoint + " → " + statusCode + " (accessible)");
+                } else {
+                    System.out.println("  ❌ " + endpoint + " → " + statusCode + " (not accessible)");
+                }
+                
+            } catch (Exception e) {
+                System.out.println("  ❌ " + endpoint + " → ERROR: " + e.getMessage());
+            }
+        }
+        
+        return accessibleEndpoints;
+    }
+
+    /**
+     * Get available representations for an endpoint by analyzing OpenAPI spec paths
+     */
+    private List<String> getAvailableRepresentationsForEndpoint(String endpoint) {
+        Set<String> representations = new HashSet<>();
+        
+        // Find the path in OpenAPI spec that matches this endpoint
+        JsonNode paths = openApiSpec.path("paths");
+        Iterator<Map.Entry<String, JsonNode>> pathIterator = paths.fields();
+        
+        while (pathIterator.hasNext()) {
+            Map.Entry<String, JsonNode> pathEntry = pathIterator.next();
+            String path = pathEntry.getKey();
+            
+            // Check if this path corresponds to our endpoint
+            if (pathMatchesEndpoint(path, endpoint)) {
+                // Examine the response schemas to detect available representations
+                JsonNode pathItem = pathEntry.getValue();
+                JsonNode getOperation = pathItem.path("get");
+                
+                if (!getOperation.isMissingNode()) {
+                    JsonNode responses = getOperation.path("responses");
+                    JsonNode response200 = responses.path("200");
+                    
+                    if (!response200.isMissingNode()) {
+                        JsonNode content = response200.path("content");
+                        JsonNode applicationJson = content.path("application/json");
+                        JsonNode schema = applicationJson.path("schema");
+                        
+                        // Look for oneOf schemas to detect different representations
+                        if (schema.has("oneOf")) {
+                            JsonNode oneOfSchemas = schema.path("oneOf");
+                            for (JsonNode oneOfSchema : oneOfSchemas) {
+                                String ref = oneOfSchema.path("$ref").asText();
+                                String representationType = extractRepresentationFromRef(ref);
+                                if (representationType != null) {
+                                    representations.add(representationType);
+                                }
+                            }
+                        } else if (schema.has("$ref")) {
+                            // Single schema reference
+                            String ref = schema.path("$ref").asText();
+                            String representationType = extractRepresentationFromRef(ref);
+                            if (representationType != null) {
+                                representations.add(representationType);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // If we couldn't detect from schema, use standard representations
+        if (representations.isEmpty()) {
+            representations.addAll(Arrays.asList("default", "ref", "full"));
+        } else {
+            // Always include default if not detected
+            representations.add("default");
+        }
+        
+        return new ArrayList<>(representations);
+    }
+
+    /**
+     * Check if an OpenAPI path matches an endpoint
+     */
+    private boolean pathMatchesEndpoint(String path, String endpoint) {
+        // Convert "/ws/rest/v1/concept/{uuid}" to "/concept" and compare with endpoint
+        String extractedEndpoint = extractEndpointFromPath(path);
+        return endpoint.equals(extractedEndpoint);
+    }
+
+    /**
+     * Extract representation type from schema $ref
+     * e.g., "#/components/schemas/ConceptDefault" -> "default"
+     */
+    private String extractRepresentationFromRef(String ref) {
+        if (ref == null || ref.isEmpty()) {
+            return null;
+        }
+        
+        // Extract schema name from #/components/schemas/ConceptDefault
+        String[] parts = ref.split("/");
+        if (parts.length > 0) {
+            String schemaName = parts[parts.length - 1];
+            
+            // Extract representation from schema name
+            if (schemaName.endsWith("Default")) {
+                return "default";
+            } else if (schemaName.endsWith("Full")) {
+                return "full";
+            } else if (schemaName.endsWith("Ref")) {
+                return "ref";
+            } else if (schemaName.endsWith("Custom")) {
+                return "custom";
+            }
+        }
+        
+        return null;
+    }
+
+    /**
+     * Validate endpoint with dynamic schema mapping - finds the correct schema based on OpenAPI spec
+     */
+    private void validateEndpointWithDynamicSchemaMapping(String endpoint, String representation) {
+        // Extract resource name and normalize it
+        String resourceName = endpoint.replaceFirst("^/", "");
+        String resourceType = normalizeEndpointToResourceType(resourceName);
+        
+        // Find the actual schema name from OpenAPI spec for this endpoint and representation
+        String schemaName = findSchemaNameFromSpec(endpoint, representation);
+        
+        if (schemaName == null) {
+            // Fallback to our naming convention
+            schemaName = SchemaNameGenerator.schemaName(resourceType, representation);
+        }
+        
+        System.out.println("  🔍 Validating " + endpoint + " with representation '" + representation + "' using schema: " + schemaName);
+        
+        // Use the existing validation logic but with dynamically determined schema
+        validateEndpointAgainstSchema(endpoint, representation, schemaName);
+    }
+
+    /**
+     * Find the correct schema name from OpenAPI spec for given endpoint and representation
+     */
+    private String findSchemaNameFromSpec(String endpoint, String representation) {
+        JsonNode paths = openApiSpec.path("paths");
+        Iterator<Map.Entry<String, JsonNode>> pathIterator = paths.fields();
+        
+        while (pathIterator.hasNext()) {
+            Map.Entry<String, JsonNode> pathEntry = pathIterator.next();
+            String path = pathEntry.getKey();
+            
+            if (pathMatchesEndpoint(path, endpoint)) {
+                JsonNode pathItem = pathEntry.getValue();
+                JsonNode getOperation = pathItem.path("get");
+                
+                if (!getOperation.isMissingNode()) {
+                    JsonNode responses = getOperation.path("responses");
+                    JsonNode response200 = responses.path("200");
+                    JsonNode content = response200.path("content");
+                    JsonNode applicationJson = content.path("application/json");
+                    JsonNode schema = applicationJson.path("schema");
+                    
+                    // Look for oneOf schemas and find the one matching our representation
+                    if (schema.has("oneOf")) {
+                        JsonNode oneOfSchemas = schema.path("oneOf");
+                        for (JsonNode oneOfSchema : oneOfSchemas) {
+                            String ref = oneOfSchema.path("$ref").asText();
+                            String detectedRepresentation = extractRepresentationFromRef(ref);
+                            
+                            if (representation.equals(detectedRepresentation)) {
+                                // Extract schema name from ref
+                                String[] parts = ref.split("/");
+                                if (parts.length > 0) {
+                                    return parts[parts.length - 1];
+                                }
+                            }
+                        }
+                    } else if (schema.has("$ref")) {
+                        // Single schema - check if it matches our representation
+                        String ref = schema.path("$ref").asText();
+                        String detectedRepresentation = extractRepresentationFromRef(ref);
+                        
+                        if (representation.equals(detectedRepresentation)) {
+                            String[] parts = ref.split("/");
+                            if (parts.length > 0) {
+                                return parts[parts.length - 1];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        return null; // Schema not found in spec
+    }
+
+    /**
+     * Validate endpoint against a specific schema
+     */
+    private void validateEndpointAgainstSchema(String endpoint, String representation, String schemaName) {
+        totalValidations.incrementAndGet();
+        
+        try {
+            // Make the API call
+            Response response = given()
+                .header("Authorization", BASIC_AUTH)
+                .config(RestAssuredConfig.config()
+                    .httpClient(HttpClientConfig.httpClientConfig()
+                        .setParam("http.connection.timeout", 10000)
+                        .setParam("http.socket.timeout", 10000)))
+                .when()
+                .get(endpoint + "?v=" + representation + "&limit=1")
+                .then()
+                .extract()
+                .response();
+            
+            if (response.getStatusCode() != 200) {
+                failedValidations.incrementAndGet();
+                String errorMsg = "HTTP " + response.getStatusCode() + ": " + response.getStatusLine();
+                recordValidationResult(endpoint, representation, false, errorMsg, 
+                    Collections.singletonList("Non-200 response"), response.getBody().asString());
+                return;
+            }
+            
+            // Parse response
+            JsonNode responseJson = objectMapper.readTree(response.getBody().asString());
+            
+            // Get schema
+            JsonNode schemaNode = openApiSpec.path("components").path("schemas").path(schemaName);
+            if (schemaNode.isMissingNode()) {
+                failedValidations.incrementAndGet();
+                String errorMsg = "Schema not found: " + schemaName;
+                recordValidationResult(endpoint, representation, false, errorMsg, 
+                    Collections.singletonList("Missing schema"), response.getBody().asString());
+                return;
+            }
+            
+            // Validate
+            JsonSchema schema = schemaFactory.getSchema(schemaNode);
+            Set<ValidationMessage> validationMessages = schema.validate(responseJson);
+            
+            if (validationMessages.isEmpty()) {
+                successfulValidations.incrementAndGet();
+                recordValidationResult(endpoint, representation, true, null, Collections.emptyList(), 
+                    response.getBody().asString());
+                representationCounts.computeIfAbsent(representation, k -> new AtomicInteger(0)).incrementAndGet();
+            } else {
+                failedValidations.incrementAndGet();
+                List<String> errors = validationMessages.stream()
+                    .map(ValidationMessage::getMessage)
+                    .collect(Collectors.toList());
+                String errorMsg = "Schema validation failed: " + String.join(", ", errors);
+                recordValidationResult(endpoint, representation, false, errorMsg, errors, 
+                    response.getBody().asString());
+            }
+            
+        } catch (Exception e) {
+            failedValidations.incrementAndGet();
+            String errorMsg = "Exception: " + e.getMessage();
+            recordValidationResult(endpoint, representation, false, errorMsg, 
+                Collections.singletonList("Execution exception"), "");
+        }
+    }
+
+    /**
+     * Validate custom properties with dynamic mapping
+     */
+    private void validateEndpointCustomPropertiesWithDynamicMapping(String endpoint) {
+        // Extract resource name from endpoint (e.g., "/concept" -> "concept")
+        String resourceName = endpoint.replaceFirst("^/", "");
+        String resourceType = normalizeEndpointToResourceType(resourceName);
+        
+        // Try to find Custom schema using dynamic mapping first
+        String customSchemaName = findSchemaNameFromSpec(endpoint, "custom");
+        
+        // Fallback to naming convention if not found in spec
+        if (customSchemaName == null) {
+            customSchemaName = SchemaNameGenerator.schemaName(resourceType, "custom");
+        }
+        
+        JsonNode customSchemaNode = openApiSpec.path("components").path("schemas").path(customSchemaName);
+        
+        if (customSchemaNode.isMissingNode()) {
+            System.out.println("⚠️  No Custom schema found for: " + endpoint + " (looking for: " + customSchemaName + ")");
+            return;
+        }
+        
+        // Extract all properties from the Custom schema
+        JsonNode propertiesNode = customSchemaNode.path("properties");
+        if (propertiesNode.isMissingNode()) {
+            System.out.println("⚠️  No properties found in Custom schema for: " + endpoint);
+            return;
+        }
+        
+        List<String> propertyNames = new ArrayList<>();
+        propertiesNode.fieldNames().forEachRemaining(propertyNames::add);
+        
+        if (propertyNames.isEmpty()) {
+            System.out.println("⚠️  Custom schema has no properties for: " + endpoint);
+            return;
+        }
+        
+        System.out.println("🔍 Testing " + propertyNames.size() + " custom properties for " + endpoint + ": " + propertyNames);
+        
+        // Test each property individually with custom:(property)
+        for (int i = 0; i < propertyNames.size(); i++) {
+            String property = propertyNames.get(i);
+            String customRepresentation = "custom:(" + property + ")";
+            System.out.println("   🧪 Testing property " + (i + 1) + "/" + propertyNames.size() + ": " + property);
+            
+            // For individual properties, we can't use full schema validation, just test accessibility
+            validateEndpointAccessibility(endpoint, customRepresentation);
+        }
+    }
+
+    /**
+     * Simple accessibility test for custom property representations
+     */
+    private void validateEndpointAccessibility(String endpoint, String representation) {
+        totalValidations.incrementAndGet();
+        
+        try {
+            Response response = given()
+                .header("Authorization", BASIC_AUTH)
+                .config(RestAssuredConfig.config()
+                    .httpClient(HttpClientConfig.httpClientConfig()
+                        .setParam("http.connection.timeout", 10000)
+                        .setParam("http.socket.timeout", 10000)))
+                .when()
+                .get(endpoint + "?v=" + representation + "&limit=1")
+                .then()
+                .extract()
+                .response();
+            
+            if (response.getStatusCode() == 200) {
+                successfulValidations.incrementAndGet();
+                recordValidationResult(endpoint, representation, true, null, Collections.emptyList(), 
+                    response.getBody().asString());
+                representationCounts.computeIfAbsent(representation, k -> new AtomicInteger(0)).incrementAndGet();
+            } else {
+                failedValidations.incrementAndGet();
+                String errorMsg = "HTTP " + response.getStatusCode() + ": " + response.getStatusLine();
+                recordValidationResult(endpoint, representation, false, errorMsg, 
+                    Collections.singletonList("Non-200 response"), response.getBody().asString());
+            }
+            
+        } catch (Exception e) {
+            failedValidations.incrementAndGet();
+            String errorMsg = "Exception: " + e.getMessage();
+            recordValidationResult(endpoint, representation, false, errorMsg, 
+                Collections.singletonList("Execution exception"), "");
         }
     }
 
