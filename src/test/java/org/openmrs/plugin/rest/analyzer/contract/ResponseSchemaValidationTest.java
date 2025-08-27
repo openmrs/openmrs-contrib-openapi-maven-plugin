@@ -15,10 +15,7 @@ import org.openmrs.plugin.rest.analyzer.util.SchemaNameGenerator;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.io.InputStream;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -37,7 +34,7 @@ public class ResponseSchemaValidationTest {
     private static final Logger log = LoggerFactory.getLogger(ResponseSchemaValidationTest.class);
     
     private static final String BASE_URL = System.getProperty("openmrs.rest.baseUrl", "http://localhost:8080/openmrs/ws/rest/v1");
-    private static final String OPENAPI_SPEC_PATH = System.getProperty("openapi.spec.path", "openapi-spec.json");
+    private static final String OPENAPI_SPEC_RESOURCE = "/openapi.json";  // Standardized location in test resources
     private static final String BASIC_AUTH = "Basic YWRtaW46QWRtaW4xMjM="; // admin:Admin123
     
     // Statistics tracking
@@ -128,13 +125,41 @@ public class ResponseSchemaValidationTest {
         System.out.println("🔚 Custom representation validation complete.");
     }
 
+    @Test
+    @Order(4)
+    @DisplayName("Validate ALL endpoints with ALL representations (comprehensive test)")
+    void validateAllEndpointsWithAllRepresentations() {
+        System.out.println("🚀 Starting COMPREHENSIVE validation of ALL endpoints with ALL representations...");
+        
+        // Standard representations that work for all endpoints
+        List<String> standardRepresentations = Arrays.asList("default", "ref", "full");
+        
+        for (String endpoint : GUARANTEED_WORKING_ENDPOINTS) {
+            System.out.println("\n📍 Testing endpoint: " + endpoint);
+            
+            // Test standard representations
+            System.out.println("  🔹 Testing standard representations...");
+            for (String representation : standardRepresentations) {
+                validateEndpointWithRepresentation(endpoint, representation);
+            }
+            
+            // Test custom property representations
+            System.out.println("  🔹 Testing custom property representations...");
+            validateEndpointCustomProperties(endpoint);
+        }
+        
+        System.out.println("\n🔚 COMPREHENSIVE validation complete for " + GUARANTEED_WORKING_ENDPOINTS.size() + " endpoints.");
+    }
+
     private void validateEndpointCustomProperties(String endpoint) {
         // Extract resource name from endpoint (e.g., "/concept" -> "concept")
         String resourceName = endpoint.replaceFirst("^/", "");
-        String normalizedResourceName = normalizeResourceName(resourceName);
         
-        // Get the Custom schema for this endpoint
-        String customSchemaName = SchemaNameGenerator.schemaName(normalizedResourceName, "custom");
+        // Use the same normalization logic as the Maven plugin for consistency
+        String resourceType = normalizeEndpointToResourceType(resourceName);
+        
+        // Get the Custom schema for this endpoint using SchemaNameGenerator (same as Maven plugin)
+        String customSchemaName = SchemaNameGenerator.schemaName(resourceType, "custom");
         JsonNode customSchemaNode = openApiSpec.path("components").path("schemas").path(customSchemaName);
         
         if (customSchemaNode.isMissingNode()) {
@@ -169,7 +194,7 @@ public class ResponseSchemaValidationTest {
     }
 
     @Test
-    @Order(4)
+    @Order(5)
     @DisplayName("Validate ALL accessible endpoints from OpenAPI spec")
     void validateAllAccessibleEndpointsFromSpec() {
         System.out.println("🚀 Starting validation of ALL accessible endpoints from OpenAPI spec...");
@@ -203,10 +228,6 @@ public class ResponseSchemaValidationTest {
             System.out.println("   Success Rate: " + String.format("%.1f%%", successRate));
         }
         
-        System.out.println("\n📊 REPRESENTATION BREAKDOWN:");
-        representationCounts.forEach((rep, count) -> 
-            System.out.println("   " + rep + ": " + count.get() + " validations"));
-        
         // Show failed validations summary
         List<ValidationResult> failures = validationResults.stream()
             .filter(r -> !r.success)
@@ -215,14 +236,13 @@ public class ResponseSchemaValidationTest {
         if (!failures.isEmpty()) {
             System.out.println("\n❌ FAILED VALIDATIONS SUMMARY:");
             failures.stream()
-                .limit(10) // Show first 10 failures
                 .forEach(result -> {
                     System.out.println("   " + result.endpoint + " (" + result.representation + "): " + result.errorMessage);
                 });
             
-            if (failures.size() > 10) {
-                System.out.println("   ... and " + (failures.size() - 10) + " more failures");
-            }
+            // if (failures.size() > 10) {
+            //     System.out.println("   ... and " + (failures.size() - 10) + " more failures");
+            // }
         }
         
         System.out.println("\n✅ Schema validation report complete!");
@@ -339,8 +359,8 @@ public class ResponseSchemaValidationTest {
     }
 
     private List<String> generatePossibleSchemaNames(String resourceName, String representation) {
-        // Normalize the resource name to match ResourceType conventions
-        String normalizedResourceName = normalizeResourceName(resourceName);
+        // Normalize the resource name to match ResourceType conventions (same as Maven plugin)
+        String resourceType = normalizeEndpointToResourceType(resourceName);
         
         // Handle custom representations specially
         String normalizedRepresentation = representation;
@@ -351,25 +371,34 @@ public class ResponseSchemaValidationTest {
         // Use SchemaNameGenerator as single source of truth for schema naming
         List<String> possibleSchemaNames = new ArrayList<>();
         
-        // Primary schema name using SchemaNameGenerator
-        String primarySchemaName = SchemaNameGenerator.schemaName(normalizedResourceName, normalizedRepresentation);
+        // Primary schema name using SchemaNameGenerator (same as Maven plugin)
+        String primarySchemaName = SchemaNameGenerator.schemaName(resourceType, normalizedRepresentation);
         possibleSchemaNames.add(primarySchemaName);
         
         // Fallback options for common representations
         if (!normalizedRepresentation.equals("default")) {
-            possibleSchemaNames.add(SchemaNameGenerator.schemaName(normalizedResourceName, "default"));
+            possibleSchemaNames.add(SchemaNameGenerator.schemaName(resourceType, "default"));
         }
         if (!normalizedRepresentation.equals("ref")) {
-            possibleSchemaNames.add(SchemaNameGenerator.schemaName(normalizedResourceName, "ref"));
+            possibleSchemaNames.add(SchemaNameGenerator.schemaName(resourceType, "ref"));
         }
         if (!normalizedRepresentation.equals("full")) {
-            possibleSchemaNames.add(SchemaNameGenerator.schemaName(normalizedResourceName, "full"));
+            possibleSchemaNames.add(SchemaNameGenerator.schemaName(resourceType, "full"));
         }
         
         return possibleSchemaNames;
     }
     
-    private String normalizeResourceName(String resourceName) {
+    /**
+     * Normalizes endpoint path to resource type name for schema lookup.
+     * This ensures consistency with how the Maven plugin generates schema names.
+     * 
+     * Examples:
+     * "/concept" -> "Concept"
+     * "/fieldtype" -> "FieldType" 
+     * "/conceptclass" -> "ConceptClass"
+     */
+    private String normalizeEndpointToResourceType(String resourceName) {
         if (resourceName == null || resourceName.isEmpty()) {
             return "Unknown";
         }
@@ -431,30 +460,17 @@ public class ResponseSchemaValidationTest {
     }
 
     private static void loadOpenApiSpec() throws Exception {
-        Path specPath = findOpenApiSpecFile();
-        String specContent = new String(Files.readAllBytes(specPath), StandardCharsets.UTF_8);
-        openApiSpec = objectMapper.readTree(specContent);
-        System.out.println("📋 Loaded OpenAPI spec from: " + specPath.toAbsolutePath());
-    }
-
-    private static Path findOpenApiSpecFile() {
-        List<Path> possiblePaths = Arrays.asList(
-            Paths.get("openapi-spec.json"),
-            Paths.get("target/openapi-spec.json"),
-            Paths.get("../openapi-spec.json"),
-            Paths.get("../../openapi-spec.json"),
-            Paths.get("webservices-rest-omod-2.5-openapi-spec.json"),
-            Paths.get("../webservices-rest-omod-2.5-openapi-spec.json"),
-            Paths.get("../../webservices-rest-omod-2.5-openapi-spec.json")
-        );
-        
-        for (Path path : possiblePaths) {
-            if (Files.exists(path)) {
-                return path;
+        // Load OpenAPI spec from standardized location in test resources
+        try (InputStream specStream = ResponseSchemaValidationTest.class.getResourceAsStream(OPENAPI_SPEC_RESOURCE)) {
+            if (specStream == null) {
+                throw new RuntimeException("OpenAPI spec file not found at: " + OPENAPI_SPEC_RESOURCE + 
+                    ". Please ensure openapi.json exists in src/test/resources/");
             }
+            
+            // Read the InputStream using ObjectMapper directly
+            openApiSpec = objectMapper.readTree(specStream);
+            System.out.println("📋 Loaded OpenAPI spec from: " + OPENAPI_SPEC_RESOURCE);
         }
-        
-        throw new RuntimeException("OpenAPI spec file not found. Checked paths: " + possiblePaths);
     }
 
     // Validation result data class
