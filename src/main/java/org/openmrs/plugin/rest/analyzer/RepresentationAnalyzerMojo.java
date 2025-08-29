@@ -60,22 +60,6 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         return "openapi.json";
     }
 
-    /**
-     * List of OpenMRS platform versions to generate OpenAPI specifications for.
-     * When specified, the plugin will generate separate spec files for each version.
-     * 
-     * Output files will be named: {moduleName}-openapi-spec-{version}.json
-     */
-    @Parameter(property = "versionsToGenerate")
-    private List<String> versionsToGenerate;
-
-    /**
-     * Whether to fail the build if any version-specific generation fails.
-     * When false, the plugin will continue with other versions and report errors.
-     */
-    @Parameter(property = "failOnVersionError", defaultValue = "true")
-    private boolean failOnVersionError;
-
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
         
@@ -84,45 +68,36 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         log.debug("Project: {}", project.getName());
         log.debug("Output directory: {}", getOutputDirectory());
         
-        // Validate and prepare configuration
-        validateConfiguration();
+        // Prepare configuration
         prepareScanPackages();
         prepareOutputDirectory();
         
-        // Determine execution mode: single-version or multi-version
-        List<String> targetVersions = determineTargetVersions();
-        
-        if (targetVersions.size() == 1) {
-            // Single-version execution (current behavior)
-            executeSingleVersion(targetVersions.get(0));
-        } else {
-            // Multi-version execution (new feature)
-            executeMultipleVersions(targetVersions);
+        // Execute single-version generation
+        try {
+            log.info("Generating OpenAPI specification for OpenMRS version: {}", openmrsVersion);
+            
+            int exitCode = runTestInForkedProcess(openmrsVersion, getOutputFileName());
+            
+            if (exitCode != 0) {
+                throw new MojoExecutionException("Test execution failed with exit code: " + exitCode);
+            }
+            
+            processAnalysisResults();
+            
+            log.info("Representation analysis completed successfully");
+            log.info("=============================="); 
+        } catch (IOException | InterruptedException e) {
+            log.error("Process execution error: {}", e.getMessage(), e);
+            if (e instanceof InterruptedException) {
+                Thread.currentThread().interrupt();
+            }
+            throw new MojoExecutionException("Failed to execute analysis process", e);
         }
     }
 
     /**
      * Validates the plugin configuration and reports any issues.
      */
-    private void validateConfiguration() throws MojoExecutionException {
-        if (versionsToGenerate != null && !versionsToGenerate.isEmpty()) {
-            for (String version : versionsToGenerate) {
-                if (!isValidVersion(version)) {
-                    throw new MojoExecutionException("Invalid version format: " + version + 
-                        ". Expected semantic version like '2.4.6' or '2.3.4'");
-                }
-            }
-            
-            // Check for duplicates
-            if (versionsToGenerate.size() != versionsToGenerate.stream().distinct().count()) {
-                throw new MojoExecutionException("Duplicate versions found in versionsToGenerate");
-            }
-            
-            log.info("Multi-version generation enabled for {} versions: {}", 
-                    versionsToGenerate.size(), versionsToGenerate);
-        }
-    }
-
     /**
      * Prepares scan packages using auto-detection if needed.
      */
@@ -135,6 +110,11 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         } else {
             log.warn("No scan packages specified and auto-detection disabled. May not find resources.");
             scanPackages = new ArrayList<>();
+        }
+        
+        File outputDir = new File(getOutputDirectory());
+        if (!outputDir.exists()) {
+            outputDir.mkdirs();
         }
     }
 
@@ -151,80 +131,11 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
     /**
      * Determines which versions to generate specs for.
      */
-    private List<String> determineTargetVersions() {
-        if (versionsToGenerate != null && !versionsToGenerate.isEmpty()) {
-            return new ArrayList<>(versionsToGenerate);
-        } else {
-            // Single-version mode using openmrsVersion parameter
-            List<String> singleVersion = new ArrayList<>();
-            singleVersion.add(openmrsVersion);
-            return singleVersion;
-        }
-    }
-
     /**
-     * Executes OpenAPI generation for a single OpenMRS version.
+     * Runs the analysis in a forked JVM process to avoid ClassLoader conflicts.
+     * This is essential because the plugin needs to load OpenMRS classes that may
+     * conflict with Maven's runtime environment.
      */
-    private void executeSingleVersion(String version) throws MojoExecutionException {
-        log.info("Generating OpenAPI specification for OpenMRS version: {}", version);
-        
-        try {
-            String versionSpecificOutputFile = getOutputFileName(); // Use hardcoded filename for single version
-            int exitCode = runTestInForkedProcess(version, versionSpecificOutputFile);
-            
-            if (exitCode != 0) {
-                throw new MojoExecutionException("Test execution failed with exit code: " + exitCode);
-            }
-            
-            processAnalysisResults();
-            
-            log.info("Representation analysis completed successfully");
-            log.info("=============================="); 
-        } catch (IOException | InterruptedException e) {
-            handleExecutionError(e, version);
-        }
-    }
-
-    /**
-     * Executes OpenAPI generation for multiple OpenMRS versions.
-     */
-    private void executeMultipleVersions(List<String> versions) throws MojoExecutionException {
-        log.info("=== Multi-Version OpenAPI Generation ===");
-        log.info("Generating specifications for {} versions: {}", versions.size(), versions);
-        
-        List<String> successfulVersions = new ArrayList<>();
-        List<String> failedVersions = new ArrayList<>();
-        
-        for (String version : versions) {
-            try {
-                log.info("--- Processing OpenMRS version: {} ---", version);
-                
-                String versionSpecificOutputFile = generateVersionSpecificFilename(version);
-                int exitCode = runTestInForkedProcess(version, versionSpecificOutputFile);
-                
-                if (exitCode != 0) {
-                    throw new MojoExecutionException("Test execution failed for version " + version + 
-                        " with exit code: " + exitCode);
-                }
-                
-                successfulVersions.add(version);
-                log.info("OpenMRS {}: {} generated successfully", version, versionSpecificOutputFile);
-                
-            } catch (Exception e) {
-                failedVersions.add(version);
-                log.error("OpenMRS {}: Generation failed - {}", version, e.getMessage());
-                
-                if (failOnVersionError) {
-                    throw new MojoExecutionException("Failed to generate spec for version " + version, e);
-                }
-            }
-        }
-        
-        if (!failedVersions.isEmpty() && failOnVersionError) {
-            throw new MojoExecutionException("One or more versions failed to generate");
-        }
-    }
-    
     private int runTestInForkedProcess(String targetVersion, String targetOutputFile) throws IOException, InterruptedException {
         
         List<String> classpath = ModuleClasspathBuilder.buildTargetModuleClasspath(project);
@@ -334,40 +245,4 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         log.debug("==============================");
     }
     
-    /**
-     * Validates if a version string follows semantic versioning format.
-     */
-    private boolean isValidVersion(String version) {
-        if (version == null || version.trim().isEmpty()) {
-            return false;
-        }
-        
-        // Basic semantic version validation (e.g., 2.4.6, 2.3.4)
-        return version.matches("^\\d+\\.\\d+(\\.\\d+)?(\\.\\w+)*(-\\w+)?$");
-    }
-    
-    /**
-     * Generates version-specific output filename.
-     */
-    private String generateVersionSpecificFilename(String version) {
-        String baseFilename = getOutputFileName();
-        
-        // Remove .json extension if present
-        if (baseFilename.endsWith(".json")) {
-            baseFilename = baseFilename.substring(0, baseFilename.length() - 5);
-        }
-        
-        return baseFilename + "-" + version + ".json";
-    }
-    
-    /**
-     * Handles execution errors for version-specific generation.
-     */
-    private void handleExecutionError(Exception e, String version) throws MojoExecutionException {
-        log.error("Process execution error for version {}: {}", version, e.getMessage(), e);
-        if (e instanceof InterruptedException) {
-            Thread.currentThread().interrupt();
-        }
-        throw new MojoExecutionException("Failed to execute analysis process for version " + version, e);
-    }
 }

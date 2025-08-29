@@ -387,12 +387,10 @@ public class ModuleClasspathBuilder {
             return artifactId.substring("openmrs-module-".length());
         }
         
-        // Handle omod artifacts: "queue-omod" -> "queue"
         if (artifactId.endsWith("-omod")) {
             return artifactId.substring(0, artifactId.length() - "-omod".length());
         }
         
-        // Handle webservices.rest omod variants: "webservices.rest-omod-2.4" -> "webservices.rest"
         if (artifactId.startsWith("webservices.rest-omod")) {
             return "webservices.rest";
         }
