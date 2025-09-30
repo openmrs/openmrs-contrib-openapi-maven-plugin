@@ -1,7 +1,12 @@
 package org.openmrs.plugin;
 
 import java.time.LocalDate;
+import java.util.Collection;
 import java.util.List;
+
+import org.openmrs.api.context.Context;
+import org.openmrs.module.webservices.rest.web.api.RestService;
+import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
 
 import io.swagger.v3.core.converter.ModelConverters;
 import io.swagger.v3.core.converter.ResolvedSchema;
