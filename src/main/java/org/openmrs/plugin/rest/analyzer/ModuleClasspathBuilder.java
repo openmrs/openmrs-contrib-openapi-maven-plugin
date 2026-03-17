@@ -162,12 +162,12 @@ public class ModuleClasspathBuilder {
         // Plugin dependencies as declared in pom.xml (but resolved dynamically)
         String[][] dependencies = {
             // Swagger dependencies
-            {"io.swagger.core.v3", "swagger-models", "2.2.15"},
-            {"io.swagger.core.v3", "swagger-core", "2.2.15"},
-            {"io.swagger.core.v3", "swagger-annotations", "2.2.15"},
+            {"io.swagger.core.v3", "swagger-models", "2.2.22"},
+            {"io.swagger.core.v3", "swagger-core", "2.2.22"},
+            {"io.swagger.core.v3", "swagger-annotations", "2.2.22"},
             {"com.fasterxml.jackson.datatype", "jackson-datatype-jsr310", "2.13.4"},
             // JUnit Platform dependencies
-            {"org.junit.platform", "junit-platform-console-standalone", "1.8.2"}
+            {"org.junit.platform", "junit-platform-console-standalone", "6.0.3"}
         };
         
         for (String repoPath : repoPaths) {
@@ -205,21 +205,21 @@ public class ModuleClasspathBuilder {
             File targetDir = new File(currentDir, "target");
             
             if (targetDir.exists()) {
-                File[] testJars = targetDir.listFiles((dir, name) -> 
-                    name.endsWith("-tests.jar") && name.contains("openmrs-rest-analyzer")
+                File[] testJars = targetDir.listFiles((dir, name) ->
+                    name.endsWith("-tests.jar") && name.contains("openmrs-openapi-maven-plugin")
                 );
-                
+
                 if (testJars != null && testJars.length > 0) {
                     return testJars[0].getAbsolutePath();
                 }
             }
-            
+
             File parentDir = currentDir.getParentFile();
             if (parentDir != null) {
-                File parentTarget = new File(parentDir, "openmrs-rest-representation-analyzer/target");
+                File parentTarget = new File(parentDir, "openmrs-contrib-openapi-maven-plugin/target");
                 if (parentTarget.exists()) {
-                    File[] testJars = parentTarget.listFiles((dir, name) -> 
-                        name.endsWith("-tests.jar") && name.contains("openmrs-rest-analyzer")
+                    File[] testJars = parentTarget.listFiles((dir, name) ->
+                        name.endsWith("-tests.jar") && name.contains("openmrs-openapi-maven-plugin")
                     );
                     
                     if (testJars != null && testJars.length > 0) {
@@ -246,12 +246,13 @@ public class ModuleClasspathBuilder {
             if (repoPath == null) continue;
             
             String testJarPath = repoPath + File.separator +
-                "org" + File.separator + 
-                "openmrs" + File.separator + 
-                "plugin" + File.separator + 
-                "openmrs-rest-analyzer" + File.separator + 
-                version + File.separator + 
-                "openmrs-rest-analyzer-" + version + "-tests.jar";
+                "org" + File.separator +
+                "openmrs" + File.separator +
+                "maven" + File.separator +
+                "plugins" + File.separator +
+                "openmrs-openapi-maven-plugin" + File.separator +
+                version + File.separator +
+                "openmrs-openapi-maven-plugin-" + version + "-tests.jar";
             
             File testJar = new File(testJarPath);
             if (testJar.exists()) {
@@ -297,26 +298,26 @@ public class ModuleClasspathBuilder {
             
             File targetDir = new File(currentDir, "target");
             if (targetDir.exists()) {
-                File[] mainJars = targetDir.listFiles((dir, name) -> 
-                    name.endsWith(".jar") && 
-                    name.contains("openmrs-rest-analyzer") && 
+                File[] mainJars = targetDir.listFiles((dir, name) ->
+                    name.endsWith(".jar") &&
+                    name.contains("openmrs-openapi-maven-plugin") &&
                     !name.endsWith("-tests.jar") &&
                     !name.contains("-sources") &&
                     !name.contains("-javadoc")
                 );
-                
+
                 if (mainJars != null && mainJars.length > 0) {
                     return mainJars[0].getAbsolutePath();
                 }
             }
-            
+
             File parentDir = currentDir.getParentFile();
             if (parentDir != null) {
-                File parentTarget = new File(parentDir, "openmrs-rest-representation-analyzer/target");
+                File parentTarget = new File(parentDir, "openmrs-contrib-openapi-maven-plugin/target");
                 if (parentTarget.exists()) {
-                    File[] mainJars = parentTarget.listFiles((dir, name) -> 
-                        name.endsWith(".jar") && 
-                        name.contains("openmrs-rest-analyzer") && 
+                    File[] mainJars = parentTarget.listFiles((dir, name) ->
+                        name.endsWith(".jar") &&
+                        name.contains("openmrs-openapi-maven-plugin") &&
                         !name.endsWith("-tests.jar") &&
                         !name.contains("-sources") &&
                         !name.contains("-javadoc")
@@ -346,12 +347,13 @@ public class ModuleClasspathBuilder {
             if (repoPath == null) continue;
             
             String mainJarPath = repoPath + File.separator +
-                "org" + File.separator + 
-                "openmrs" + File.separator + 
-                "plugin" + File.separator + 
-                "openmrs-rest-analyzer" + File.separator + 
-                version + File.separator + 
-                "openmrs-rest-analyzer-" + version + ".jar";
+                "org" + File.separator +
+                "openmrs" + File.separator +
+                "maven" + File.separator +
+                "plugins" + File.separator +
+                "openmrs-openapi-maven-plugin" + File.separator +
+                version + File.separator +
+                "openmrs-openapi-maven-plugin-" + version + ".jar";
             
             File mainJar = new File(mainJarPath);
             if (mainJar.exists()) {

@@ -167,8 +167,9 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         command.add("-Dopenmrs.version=" + targetVersion);
         
         command.add("org.junit.platform.console.ConsoleLauncher");
-        command.add("--select-class");
-        command.add("org.openmrs.plugin.rest.analyzer.test.OpenmrsOpenapiSpecGeneratorTest");
+        command.add("execute");
+        command.add("--select-method");
+        command.add("org.openmrs.plugin.rest.analyzer.test.CustomModelResolverSpecGenerator#generateOpenAPISpec");
         
         log.info("Executing analysis for module: {} with packages: {}", 
                 project.getArtifactId(), scanPackages);

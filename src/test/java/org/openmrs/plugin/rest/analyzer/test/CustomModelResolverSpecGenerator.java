@@ -128,8 +128,11 @@ public class CustomModelResolverSpecGenerator extends BaseModuleWebContextSensit
 
         Components components = new Components();
 
+        String outputDir = System.getProperty("analysisOutputDir", "target/openapi-spec");
+        String outputFile = System.getProperty("analysisOutputFile", "openapi-spec-output.json");
+
         // directory for individual schema files
-        Path schemaDir = Paths.get("target", "openapi-spec", "generated-schemas");
+        Path schemaDir = Paths.get(outputDir, "generated-schemas");
         try {
             Files.createDirectories(schemaDir);
         } catch (Exception e) {
@@ -169,7 +172,7 @@ public class CustomModelResolverSpecGenerator extends BaseModuleWebContextSensit
         openAPI.components(components);
 
         // write the final OpenAPI file with refs to generated schema files
-        Path openApiOut = Paths.get("target", "openapi-spec", "openapi-spec-output.json");
+        Path openApiOut = Paths.get(outputDir, outputFile);
         try {
             Files.createDirectories(openApiOut.getParent());
             String json = io.swagger.v3.core.util.Json.pretty(openAPI);

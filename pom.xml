@@ -17,12 +17,12 @@
     </description>
 
     <properties>
-        <maven.compiler.source>8</maven.compiler.source>
-        <maven.compiler.target>8</maven.compiler.target>
+        <maven.compiler.source>21</maven.compiler.source>
+        <maven.compiler.target>21</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        
-        <openmrs.version>2.4.6-SNAPSHOT</openmrs.version>
-        <webservices.rest.version>2.50.0-SNAPSHOT</webservices.rest.version>
+
+        <openmrs.version>3.0.0-SNAPSHOT</openmrs.version>
+        <webservices.rest.version>4.0.0-SNAPSHOT</webservices.rest.version>
         
         <maven.version>3.6.3</maven.version>
         <junit.version>4.13.2</junit.version>
@@ -50,7 +50,7 @@
         <dependency>
             <groupId>org.apache.maven.plugin-tools</groupId>
             <artifactId>maven-plugin-annotations</artifactId>
-            <version>3.6.0</version>
+            <version>3.10.2</version>
             <scope>provided</scope>
         </dependency>
         
@@ -62,19 +62,19 @@
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-api</artifactId>
-            <version>5.8.2</version>
+            <version>6.0.3</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.junit.jupiter</groupId>
             <artifactId>junit-jupiter-engine</artifactId>
-            <version>5.8.2</version>
+            <version>6.0.3</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.junit.platform</groupId>
             <artifactId>junit-platform-console-standalone</artifactId>
-            <version>1.8.2</version>
+            <version>6.0.3</version>
         </dependency>
         <dependency>
             <groupId>org.openmrs.web</groupId>
@@ -118,14 +118,14 @@
         </dependency>
         <dependency>
             <groupId>org.openmrs.module</groupId>
-            <artifactId>webservices.rest-omod-2.4</artifactId>
+            <artifactId>webservices.rest-omod</artifactId>
             <version>${webservices.rest.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
-            <version>1.4.200</version>
+            <version>2.3.232</version>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -133,8 +133,9 @@
             <artifactId>slf4j-api</artifactId>
         </dependency>
         <dependency>
-            <groupId>javax.servlet</groupId>
-            <artifactId>javax.servlet-api</artifactId>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <version>6.1.0</version>
         </dependency>
         <dependency>
             <groupId>io.swagger.core.v3</groupId>
@@ -158,7 +159,7 @@
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-plugin-plugin</artifactId>
-                <version>3.6.0</version>
+                <version>3.10.2</version>
                 <configuration>
                     <goalPrefix>openmrs-rest-analyzer</goalPrefix>
                 </configuration>
@@ -169,8 +170,8 @@
                 <artifactId>maven-compiler-plugin</artifactId>
                 <version>3.11.0</version>
                 <configuration>
-                    <source>8</source>
-                    <target>8</target>
+                    <source>21</source>
+                    <target>21</target>
                 </configuration>
             </plugin>
             
@@ -194,7 +195,7 @@
                     <dependency>
                         <groupId>org.junit.vintage</groupId>
                         <artifactId>junit-vintage-engine</artifactId>
-                        <version>5.8.2</version>
+                        <version>6.0.3</version>
                     </dependency>
                 </dependencies>
             </plugin>
@@ -213,6 +214,9 @@
                         <configuration>
                             <includes>
                                 <include>**/*Test.class</include>
+                                <include>**/CustomModelResolverSpecGenerator.class</include>
+                                <include>**/CustomModelResolver.class</include>
+                                <include>**/OpenmrsResourceAnnotatedType.class</include>
                                 <include>**/introspection/**/*.class</include>
                             </includes>
                         </configuration>

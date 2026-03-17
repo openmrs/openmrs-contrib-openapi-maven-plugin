@@ -11,7 +11,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.commons.beanutils.PropertyUtils;
-import org.apache.commons.lang.StringUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.openmrs.ConceptDatatype;
 import org.openmrs.OpenmrsObject;
 import org.openmrs.module.webservices.rest.SimpleObject;
