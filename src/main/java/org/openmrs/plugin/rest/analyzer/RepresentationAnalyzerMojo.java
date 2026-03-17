@@ -13,94 +13,72 @@ import org.slf4j.LoggerFactory;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
+import java.net.MalformedURLException;
+import java.net.URL;
+import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
-import java.util.concurrent.TimeUnit;
+import java.util.Set;
 
-@Mojo(name = "analyze-representations", 
+@Mojo(name = "analyze-representations",
       defaultPhase = LifecyclePhase.PROCESS_CLASSES,
       requiresDependencyResolution = ResolutionScope.TEST)
 public class RepresentationAnalyzerMojo extends AbstractMojo {
-    
+
     private static final Logger log = LoggerFactory.getLogger(RepresentationAnalyzerMojo.class);
 
     @Parameter(defaultValue = "${project}", required = true, readonly = true)
     private MavenProject project;
 
-    @Parameter(defaultValue = "300", property = "timeoutSeconds")
-    private int timeoutSeconds;
-
     @Parameter(defaultValue = "2.4.x", property = "openmrsVersion")
     private String openmrsVersion;
-    
+
     @Parameter(property = "scanPackages")
     private List<String> scanPackages;
-    
+
     @Parameter(property = "autoDetectResources", defaultValue = "true")
     private boolean autoDetectResources;
 
-    /**
-     * Gets the hardcoded output directory for OpenAPI specifications.
-     * Always uses target/openapi for consistency and predictability.
-     * 
-     * @return the output directory path
-     */
     private String getOutputDirectory() {
         return project.getBuild().getDirectory() + "/openapi";
     }
 
-    /**
-     * Gets the hardcoded output file name for OpenAPI specifications.
-     * Always uses openapi.json for consistency and predictability.
-     * 
-     * @return the output file name
-     */
     private String getOutputFileName() {
         return "openapi.json";
     }
 
     @Override
     public void execute() throws MojoExecutionException, MojoFailureException {
-        
+
+        if ("pom".equals(project.getPackaging())) {
+            log.info("Skipping analyze-representations for POM module: {}", project.getArtifactId());
+            return;
+        }
+
         log.info("=== OpenMRS REST Representation Analyzer ===");
         log.info("Target module: {}", project.getArtifactId());
         log.debug("Project: {}", project.getName());
         log.debug("Output directory: {}", getOutputDirectory());
-        
-        // Prepare configuration
+
         prepareScanPackages();
         prepareOutputDirectory();
-        
-        // Execute single-version generation
+
+        log.info("Generating OpenAPI specification for OpenMRS version: {}", openmrsVersion);
+        runGeneratorDirectly();
+
         try {
-            log.info("Generating OpenAPI specification for OpenMRS version: {}", openmrsVersion);
-            
-            int exitCode = runTestInForkedProcess(openmrsVersion, getOutputFileName());
-            
-            if (exitCode != 0) {
-                throw new MojoExecutionException("Test execution failed with exit code: " + exitCode);
-            }
-            
             processAnalysisResults();
-            
-            log.info("Representation analysis completed successfully");
-            log.info("=============================="); 
-        } catch (IOException | InterruptedException e) {
-            log.error("Process execution error: {}", e.getMessage(), e);
-            if (e instanceof InterruptedException) {
-                Thread.currentThread().interrupt();
-            }
-            throw new MojoExecutionException("Failed to execute analysis process", e);
+        } catch (IOException e) {
+            throw new MojoExecutionException("Failed to process analysis results", e);
         }
+
+        log.info("Representation analysis completed successfully");
+        log.info("==============================");
     }
 
-    /**
-     * Validates the plugin configuration and reports any issues.
-     */
-    /**
-     * Prepares scan packages using auto-detection if needed.
-     */
     private void prepareScanPackages() {
         if (autoDetectResources && (scanPackages == null || scanPackages.isEmpty())) {
             scanPackages = ModuleClasspathBuilder.detectResourcePackages(project);
@@ -111,16 +89,13 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
             log.warn("No scan packages specified and auto-detection disabled. May not find resources.");
             scanPackages = new ArrayList<>();
         }
-        
+
         File outputDir = new File(getOutputDirectory());
         if (!outputDir.exists()) {
             outputDir.mkdirs();
         }
     }
 
-    /**
-     * Creates output directory if it doesn't exist.
-     */
     private void prepareOutputDirectory() {
         File outputDir = new File(getOutputDirectory());
         if (!outputDir.exists()) {
@@ -129,93 +104,113 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
     }
 
     /**
-     * Determines which versions to generate specs for.
+     * Runs the spec generator in-process using a fully isolated URLClassLoader.
+     *
+     * To avoid classloader conflicts (e.g. OpenMRS's Class.forName() calls using the
+     * plugin ClassRealm which lacks module-specific JARs like legacyui), we build one
+     * flat classpath that combines:
+     *   1. All JARs from the plugin's own ClassRealm (OpenMRS platform, Swagger, Spring, etc.)
+     *   2. The target module's compiled classes and test artifact JARs
+     *
+     * This isolated URLClassLoader uses the JDK platform classloader as parent (not the
+     * Maven plugin ClassRealm), so all OpenMRS/Spring class loading happens within the
+     * isolated loader — mirroring what the forked JVM did, but in-process.
+     *
+     * The generator is invoked via reflection to avoid class identity conflicts
+     * between the isolated loader and the plugin ClassRealm.
      */
-    /**
-     * Runs the analysis in a forked JVM process to avoid ClassLoader conflicts.
-     * This is essential because the plugin needs to load OpenMRS classes that may
-     * conflict with Maven's runtime environment.
-     */
-    private int runTestInForkedProcess(String targetVersion, String targetOutputFile) throws IOException, InterruptedException {
-        
-        List<String> classpath = ModuleClasspathBuilder.buildTargetModuleClasspath(project);
-        String classpathString = String.join(File.pathSeparator, classpath);
-        
-        log.debug("Forked process will use {} classpath entries for module: {}", 
-                classpath.size(), project.getArtifactId());
-        
-        List<String> command = new ArrayList<>();
-        command.add(getJavaExecutable());
-        command.add("-cp");
-        command.add(classpathString);
-        
-        command.add("-DdatabaseUrl=jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1");
-        command.add("-DdatabaseDriver=org.h2.Driver");
-        command.add("-DuseInMemoryDatabase=true");
-        command.add("-DdatabaseUsername=sa");
-        command.add("-DdatabasePassword=");
-        command.add("-Djava.awt.headless=true");
-        
-        command.add("-Dtarget.module.groupId=" + project.getGroupId());
-        command.add("-Dtarget.module.artifactId=" + project.getArtifactId());
-        command.add("-Dtarget.module.version=" + project.getVersion());
-        command.add("-Dtarget.module.packages=" + String.join(",", scanPackages));
-        command.add("-Dtarget.module.classesDir=" + project.getBuild().getOutputDirectory());
-        
-        command.add("-DanalysisOutputDir=" + getOutputDirectory());
-        command.add("-DanalysisOutputFile=" + targetOutputFile);
-        command.add("-Dopenmrs.version=" + targetVersion);
-        
-        command.add("org.junit.platform.console.ConsoleLauncher");
-        command.add("execute");
-        command.add("--select-method");
-        command.add("org.openmrs.plugin.rest.analyzer.test.CustomModelResolverSpecGenerator#generateOpenAPISpec");
-        
-        log.info("Executing analysis for module: {} with packages: {}", 
-                project.getArtifactId(), scanPackages);
-        log.debug("Executing command: {}", String.join(" ", command));
-        
-        ProcessBuilder pb = new ProcessBuilder(command);
-        pb.inheritIO();
-        pb.directory(project.getBasedir());
-        
-        Process process = pb.start();
-        
-        boolean finished = process.waitFor(timeoutSeconds, TimeUnit.SECONDS);
-        
-        if (!finished) {
-            process.destroyForcibly();
-            throw new RuntimeException("Test execution timed out after " + timeoutSeconds + " seconds");
+    private void runGeneratorDirectly() throws MojoExecutionException {
+        // 1. Collect plugin ClassRealm URLs (OpenMRS platform, Swagger, Spring, etc.)
+        URL[] pluginUrls = ((URLClassLoader) getClass().getClassLoader()).getURLs();
+
+        // 2. Collect target module classpath entries
+        List<String> moduleClasspath = ModuleClasspathBuilder.buildTargetModuleClasspath(project);
+        URL[] moduleUrls = new URL[moduleClasspath.size()];
+        for (int i = 0; i < moduleClasspath.size(); i++) {
+            try {
+                moduleUrls[i] = new File(moduleClasspath.get(i)).toURI().toURL();
+            } catch (MalformedURLException e) {
+                throw new MojoExecutionException("Invalid classpath entry: " + moduleClasspath.get(i), e);
+            }
         }
-        
-        return process.exitValue();
+
+        // 3. Combine: plugin JARs first (their versions take precedence), then module deps.
+        // Deduplicate by filename to prevent the same JAR from being loaded twice
+        // (e.g. omod-common.jar appears in both plugin ClassRealm and module test artifacts).
+        Set<String> pluginFileNames = new java.util.HashSet<>();
+        for (URL url : pluginUrls) {
+            String path = url.getPath();
+            pluginFileNames.add(path.substring(path.lastIndexOf('/') + 1));
+        }
+        List<URL> allUrls = new ArrayList<>(Arrays.asList(pluginUrls));
+        for (URL moduleUrl : moduleUrls) {
+            String path = moduleUrl.getPath();
+            String fileName = path.substring(path.lastIndexOf('/') + 1);
+            if (!pluginFileNames.contains(fileName)) {
+                allUrls.add(moduleUrl);
+            } else {
+                log.debug("Skipping duplicate module URL (already in plugin ClassRealm): {}", fileName);
+            }
+        }
+
+        log.debug("Isolated URLClassLoader: {} plugin URLs + {} module URLs",
+                pluginUrls.length, moduleUrls.length);
+
+        // 4. Set system properties (previously passed as -D flags to the forked JVM)
+        System.setProperty("useInMemoryDatabase", "true");
+        System.setProperty("databaseUrl", "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1");
+        System.setProperty("databaseDriver", "org.h2.Driver");
+        System.setProperty("databaseUsername", "sa");
+        System.setProperty("databasePassword", "");
+        System.setProperty("java.awt.headless", "true");
+        System.setProperty("target.module.groupId", project.getGroupId());
+        System.setProperty("target.module.artifactId", project.getArtifactId());
+        System.setProperty("target.module.version", project.getVersion());
+        System.setProperty("target.module.packages", String.join(",", scanPackages));
+        System.setProperty("target.module.classesDir", project.getBuild().getOutputDirectory());
+        System.setProperty("analysisOutputDir", getOutputDirectory());
+        System.setProperty("analysisOutputFile", getOutputFileName());
+        System.setProperty("openmrs.version", openmrsVersion);
+
+        ClassLoader originalClassLoader = Thread.currentThread().getContextClassLoader();
+        // Use the system classloader as parent so JDK platform modules (java.sql, etc.) are
+        // accessible. This is Java 8 compatible and in Java 9+ it chains through the platform
+        // classloader, which provides javax.sql, javax.xml, etc. without exposing Maven internals.
+        URLClassLoader isolatedClassLoader = new URLClassLoader(
+                allUrls.toArray(new URL[0]),
+                ClassLoader.getSystemClassLoader());
+
+        try {
+            Thread.currentThread().setContextClassLoader(isolatedClassLoader);
+
+            // Load and invoke via reflection to avoid class identity conflicts
+            Class<?> generatorClass = isolatedClassLoader.loadClass(
+                    "org.openmrs.plugin.rest.analyzer.OpenApiSpecGenerator");
+            Object generator = generatorClass.getDeclaredConstructor().newInstance();
+            generatorClass.getMethod("setup").invoke(generator);
+            generatorClass.getMethod("generateOpenAPISpec").invoke(generator);
+
+        } catch (InvocationTargetException e) {
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            throw new MojoExecutionException("Failed to generate OpenAPI specification", cause);
+        } catch (Exception e) {
+            throw new MojoExecutionException("Failed to generate OpenAPI specification", e);
+        } finally {
+            Thread.currentThread().setContextClassLoader(originalClassLoader);
+            try {
+                isolatedClassLoader.close();
+            } catch (IOException e) {
+                log.warn("Failed to close isolated URLClassLoader: {}", e.getMessage());
+            }
+        }
     }
-    
-    private String getJavaExecutable() {
-        String javaHome = System.getProperty("java.home");
-        if (javaHome == null) {
-            return "java";
-        }
-        
-        File javaExe = new File(javaHome, "bin/java");
-        if (javaExe.exists()) {
-            return javaExe.getAbsolutePath();
-        }
-        
-        javaExe = new File(javaHome, "bin/java.exe");
-        if (javaExe.exists()) {
-            return javaExe.getAbsolutePath();
-        }
-        
-        return "java";
-    }
-    
+
     private void processAnalysisResults() throws IOException {
         File expectedOutput = new File(getOutputDirectory(), getOutputFileName());
-        
+
         if (!expectedOutput.exists()) {
             log.warn("Expected output file not found: {}", expectedOutput.getAbsolutePath());
-            
+
             File targetDir = new File(getOutputDirectory());
             File[] jsonFiles = targetDir.listFiles((dir, name) -> name.endsWith(".json"));
             if (jsonFiles != null && jsonFiles.length > 0) {
@@ -226,24 +221,21 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
             }
             return;
         }
-        
+
         String content = new String(Files.readAllBytes(expectedOutput.toPath()));
         log.debug("=== Analysis Results Summary ===");
         log.debug("Analysis output: {}", expectedOutput.getAbsolutePath());
         log.debug("Output size: {} characters", content.length());
-        
-        if (content.contains("\"resourceCount\"")) {
-            log.debug("Resource analysis completed successfully");
-        } else if (content.contains("\"resources\"")) {
+
+        if (content.contains("\"resourceCount\"") || content.contains("\"resources\"")) {
             log.debug("Resource analysis completed successfully");
         }
-        
+
         File finalOutputFile = new File(getOutputDirectory(), getOutputFileName());
-        Files.copy(expectedOutput.toPath(), finalOutputFile.toPath(), 
+        Files.copy(expectedOutput.toPath(), finalOutputFile.toPath(),
                   java.nio.file.StandardCopyOption.REPLACE_EXISTING);
         log.debug("Final output: {}", finalOutputFile.getAbsolutePath());
-        
+
         log.debug("==============================");
     }
-    
 }

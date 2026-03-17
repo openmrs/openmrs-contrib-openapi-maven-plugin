@@ -58,7 +58,7 @@ public class CustomModelResolver extends ModelResolver {
         for(Schema<?> repSchema: representationSchemas) {
           combinedSchema.addAnyOfItem(repSchema);
         }
-        
+
         combinedSchema.setDescription("One of the supported representations for " + getResourceName(handler));
         return combinedSchema;
       }
@@ -78,7 +78,7 @@ public class CustomModelResolver extends ModelResolver {
   public <T> List<Schema<?>> resolveRepresentationSchemasForResource(OpenmrsResourceAnnotatedType<T> type, ModelConverterContext context, Iterator<ModelConverter> chain) {
     DelegatingResourceHandler<T> handler = type.getHandler();
     List<Schema<?>> ret = new ArrayList<>();
-    
+
     List<String> generatedReps = new ArrayList<>();
 
     // ========== GET representations ==========
@@ -130,8 +130,8 @@ public class CustomModelResolver extends ModelResolver {
         log.warn("Error generating schema for " + getResourceName(handler) + " create representation", e);
       }
     }
-    
-    // ========== UPDATE representations ==========    
+
+    // ========== UPDATE representations ==========
     DelegatingResourceDescription updateDesc = getUpdatableDescription(handler);
     if(updateDesc != null) {
       try {
@@ -144,7 +144,7 @@ public class CustomModelResolver extends ModelResolver {
       } catch (RuntimeException e) {
         log.warn("Error generating schema for " + getResourceName(handler) + " update representation", e);
       }
-      
+
     }
 
     log.info("Generated schemas for " + getResourceName(handler) + " representations: " + StringUtils.join(generatedReps, ", "));
@@ -179,7 +179,7 @@ public class CustomModelResolver extends ModelResolver {
    * @return
    */
   private <T> ObjectSchema resolveSchemaForResourceDescription(DelegatingResourceHandler<T> handler, DelegatingResourceDescription desc, boolean write, ModelConverterContext context, Iterator<ModelConverter> chain) {
-    
+
     if(desc == null) {
       return null;
     }
@@ -189,7 +189,7 @@ public class CustomModelResolver extends ModelResolver {
     for (Map.Entry<String, DelegatingResourceDescription.Property> e : desc.getProperties().entrySet()) {
       DelegatingResourceDescription.Property property = e.getValue();
       String propertyName = e.getKey();
-      
+
       try {
         objectSchema.addProperty(propertyName, getRestResourcePropertySchema(handler, property, write, context, chain));
         if(property.isRequired()) {
@@ -199,7 +199,7 @@ public class CustomModelResolver extends ModelResolver {
         log.warn("Error getting type of property: " + getResourceName(handler) + "." + propertyName, e1);
       }
     }
-   
+
     return objectSchema;
   }
 
@@ -210,7 +210,7 @@ public class CustomModelResolver extends ModelResolver {
     Representation rep = property.getRep();
     Type propertyType = null;
     if(delegateProperty != null) {
-      
+
       if(!write) {
         // models BaseDelegaingConverter.getProperty()
         // TODO: Model BaseDelegatingResource.getProperty()'s getResourceHandler call
@@ -276,7 +276,7 @@ public class CustomModelResolver extends ModelResolver {
   }
 
   private <T> PropertyDescriptor getPropertyDescriptor(DelegatingResourceHandler<T> handler, String property) throws IllegalAccessException, InvocationTargetException, NoSuchMethodException {
-    
+
     T delegate = null;
     try {
       // special case for Concept.datatype to get the ConceptNumeric subclass
@@ -304,16 +304,16 @@ public class CustomModelResolver extends ModelResolver {
   }
 
   private Class<?> getDelegateType(DelegatingResourceHandler<?> resource) {
-		
+
 		Class<?> resourceClass = resource.getClass();
-		
+
 		while (resourceClass != null) {
 			Type[] genericInterfaces = resourceClass.getGenericInterfaces();
 			for (Type genericInterface : genericInterfaces) {
 				if (genericInterface instanceof ParameterizedType) {
 					ParameterizedType parameterizedType = (ParameterizedType) genericInterface;
 					Type rawType = parameterizedType.getRawType();
-					
+
 					if (rawType instanceof Class
 					        && DelegatingResourceHandler.class.isAssignableFrom((Class<?>) rawType)) {
 						Type[] typeArgs = parameterizedType.getActualTypeArguments();
@@ -323,20 +323,20 @@ public class CustomModelResolver extends ModelResolver {
 					}
 				}
 			}
-			
+
 			Type genericSuperclass = resourceClass.getGenericSuperclass();
 			if (genericSuperclass instanceof ParameterizedType) {
 				ParameterizedType parameterizedType = (ParameterizedType) genericSuperclass;
 				Type[] typeArgs = parameterizedType.getActualTypeArguments();
-				
+
 				if (typeArgs.length > 0 && typeArgs[0] instanceof Class) {
 					return (Class<?>) typeArgs[0];
 				}
 			}
-			
+
 			resourceClass = resourceClass.getSuperclass();
 		}
-		
+
 		log.warn("Could not determine delegate type for " + resource.getClass().getName());
 		return null;
 	}
@@ -367,7 +367,7 @@ public class CustomModelResolver extends ModelResolver {
    */
   private boolean isOpenmrsObject(Type t) {
     return OpenmrsObject.class.isAssignableFrom(TypeFactory.rawClass(t));
-  } 
+  }
 
   private boolean isCollection(Type t) {
     Class<?> rawClass = TypeFactory.rawClass(t);
