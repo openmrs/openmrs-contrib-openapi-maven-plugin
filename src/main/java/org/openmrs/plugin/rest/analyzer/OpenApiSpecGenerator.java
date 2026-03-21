@@ -69,19 +69,8 @@ public class OpenApiSpecGenerator {
 
     private static final Logger log = LoggerFactory.getLogger(OpenApiSpecGenerator.class);
 
-    public void setup() throws Exception {
+    public void setup(String moduleClassesDir) throws Exception {
         log.info("=== Setting up OpenAPI Spec Generator ===");
-
-        String targetModuleGroupId = System.getProperty("target.module.groupId", "unknown");
-        String targetModuleArtifactId = System.getProperty("target.module.artifactId", "unknown");
-        String targetModuleVersion = System.getProperty("target.module.version", "unknown");
-        String scanPackagesStr = System.getProperty("target.module.packages", "");
-
-        log.info("Target module: {}:{}:{}", targetModuleGroupId, targetModuleArtifactId, targetModuleVersion);
-        log.info("Scan packages: {}", scanPackagesStr);
-
-        // Step 1: Ensure useInMemoryDatabase is set so TestUtil returns H2 config
-        System.setProperty("useInMemoryDatabase", "true");
 
         // NON_KEYWORDS=VALUE,KEY,NAME,TYPE: un-reserve H2 2.x keywords used as column names in OpenMRS HBM mappings
         final String h2Url = "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000;IGNORECASE=TRUE;NON_KEYWORDS=VALUE,KEY,NAME,TYPE";
@@ -133,8 +122,7 @@ public class OpenApiSpecGenerator {
             "classpath*:moduleApplicationContext.xml",
             "classpath*:openmrs-servlet.xml"
         ));
-        String moduleClassesDir = System.getProperty("target.module.classesDir", "");
-        if (!moduleClassesDir.isEmpty()) {
+        if (moduleClassesDir != null && !moduleClassesDir.isEmpty()) {
             java.io.File webModuleCtxFile = new java.io.File(moduleClassesDir, "webModuleApplicationContext.xml");
             if (webModuleCtxFile.exists()) {
                 configLocations.add("file:" + webModuleCtxFile.getAbsolutePath());
@@ -185,7 +173,7 @@ public class OpenApiSpecGenerator {
         }
     }
 
-    public void generateOpenAPISpec() {
+    public void generateOpenAPISpec(String outputDir, String outputFile) {
 
         OpenAPI openAPI = new OpenAPI(SpecVersion.V31)
             .info(new Info()
@@ -205,9 +193,6 @@ public class OpenApiSpecGenerator {
         converters.addConverter(new CustomModelResolver(Json31.mapper()));
 
         Components components = new Components();
-
-        String outputDir = System.getProperty("analysisOutputDir", "target/openapi-spec");
-        String outputFile = System.getProperty("analysisOutputFile", "openapi-spec-output.json");
 
         // directory for individual schema files
         Path schemaDir = Paths.get(outputDir, "generated-schemas");
@@ -280,10 +265,6 @@ public class OpenApiSpecGenerator {
             }
         } catch (IllegalArgumentException | SecurityException ignored) {}
 
-        String sysProp = System.getProperty("openmrs.version");
-        if (sysProp != null && !sysProp.isEmpty()) {
-            return sysProp;
-        }
-        return "2.4.x";
+        return "unknown";
     }
 }

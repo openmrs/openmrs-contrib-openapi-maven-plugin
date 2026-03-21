@@ -33,9 +33,6 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
     @Parameter(defaultValue = "${project}", required = true, readonly = true)
     private MavenProject project;
 
-    @Parameter(property = "autoDetectResources", defaultValue = "true")
-    private boolean autoDetectResources;
-
     private String getOutputDirectory() {
         return project.getBuild().getDirectory() + "/openapi";
     }
@@ -133,9 +130,6 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
 
         System.setProperty("useInMemoryDatabase", "true");
         System.setProperty("java.awt.headless", "true");
-        System.setProperty("target.module.classesDir", project.getBuild().getOutputDirectory());
-        System.setProperty("analysisOutputDir", getOutputDirectory());
-        System.setProperty("analysisOutputFile", getOutputFileName());
 
         ClassLoader originalClassLoader = Thread.currentThread().getContextClassLoader();
         // Use the system classloader as parent so JDK platform modules (java.sql, etc.) are
@@ -152,8 +146,8 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
             Class<?> generatorClass = isolatedClassLoader.loadClass(
                     "org.openmrs.plugin.rest.analyzer.OpenApiSpecGenerator");
             Object generator = generatorClass.getDeclaredConstructor().newInstance();
-            generatorClass.getMethod("setup").invoke(generator);
-            generatorClass.getMethod("generateOpenAPISpec").invoke(generator);
+            generatorClass.getMethod("setup", String.class).invoke(generator, project.getBuild().getOutputDirectory());
+            generatorClass.getMethod("generateOpenAPISpec", String.class, String.class).invoke(generator, getOutputDirectory(), getOutputFileName());
 
         } catch (InvocationTargetException e) {
             Throwable cause = e.getCause() != null ? e.getCause() : e;

@@ -2,7 +2,23 @@
 
 ![alt text](src/static/openmrs.png)
 
-A sophisticated Maven plugin that programmatically analyzes OpenMRS REST resources at build time to extract detailed representation metadata. This plugin uses a forked process approach to overcome Maven plugin classloader limitations and provides comprehensive analysis of REST resource handlers with their representation structures.
+!! This plugin is currently in development and is not ready for general use.
+
+This maven plugin aims to generate 100% complete and accurate documentation of OpenMRS REST endpoints and controllers, by inspecting the module with this plugin using reflection. It can be added to the OpenMRS REST module, or any other module that defines REST resources and controllers. It should be able to answer the following:
+- For a given module:
+  - What are its REST Resources?
+  - What are its controllers?
+- For a given OpenMRS REST Resource (ex: patient, encounter, visit):
+  - what are its supported representations (ex: `default`, `ref`, `full`)?
+  - what CRUD operations are supported?
+  - what fields are included for each supported representation?
+  - what fields are supported for custom representations: (ex: `?v=custom:(uuid,display)`)
+  - what search handlers are supported, and what are the required fields for each search handler?
+  - what are the required fields when creating the resource?
+  - what are the required fields when updating the resource?
+- For a given controller:
+  - what URL path is the controller serves?
+  - what are its inputs and outputs?
 
 ## What This Plugin Does
 
@@ -78,10 +94,10 @@ mvn clean install
 ### Basic Analysis
 ```bash
 # Run analysis on OpenMRS project
-mvn org.openmrs.plugin:openmrs-rest-analyzer:1.0.0-SNAPSHOT:analyze-representations   
+mvn openmrs-rest-analyzer:analyze-representations
 
 # With custom timeout (default: 300 seconds)
-mvn org.openmrs.plugin:openmrs-rest-analyzer:1.0.0-SNAPSHOT:analyze-representations -DtimeoutSeconds=600
+mvn openmrs-rest-analyzer:analyze-representations -DtimeoutSeconds=600
 ```
 
 ### Integrate with Build Lifecycle
