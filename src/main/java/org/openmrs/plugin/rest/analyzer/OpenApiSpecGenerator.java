@@ -107,7 +107,33 @@ public class OpenApiSpecGenerator {
         // Use file: URL for webModuleApplicationContext.xml to load only the target module's own copy,
         // avoiding double-loading when both omod-common and omod are on the classpath.
         XmlWebApplicationContext ctx = new XmlWebApplicationContext();
-        ctx.setServletContext(new MockServletContext());
+        jakarta.servlet.FilterRegistration.Dynamic noopFilter = new jakarta.servlet.FilterRegistration.Dynamic() {
+            public void addMappingForServletNames(java.util.EnumSet<jakarta.servlet.DispatcherType> d, boolean b, String... names) {}
+            public java.util.Collection<String> getServletNameMappings() { return java.util.Collections.emptyList(); }
+            public void addMappingForUrlPatterns(java.util.EnumSet<jakarta.servlet.DispatcherType> d, boolean b, String... patterns) {}
+            public java.util.Collection<String> getUrlPatternMappings() { return java.util.Collections.emptyList(); }
+            public String getName() { return ""; }
+            public String getClassName() { return ""; }
+            public boolean setInitParameter(String name, String value) { return false; }
+            public String getInitParameter(String name) { return null; }
+            public java.util.Set<String> setInitParameters(java.util.Map<String, String> initParameters) { return java.util.Collections.emptySet(); }
+            public java.util.Map<String, String> getInitParameters() { return java.util.Collections.emptyMap(); }
+            public void setAsyncSupported(boolean isAsyncSupported) {}
+        };
+        ctx.setServletContext(new MockServletContext() {
+            @Override
+            public jakarta.servlet.FilterRegistration.Dynamic addFilter(String filterName, String className) { return noopFilter; }
+            @Override
+            public jakarta.servlet.FilterRegistration.Dynamic addFilter(String filterName, jakarta.servlet.Filter filter) { return noopFilter; }
+            @Override
+            public jakarta.servlet.FilterRegistration.Dynamic addFilter(String filterName, Class<? extends jakarta.servlet.Filter> filterClass) { return noopFilter; }
+            @Override
+            public void addListener(String className) {}
+            @Override
+            public <T extends java.util.EventListener> void addListener(T t) {}
+            @Override
+            public void addListener(Class<? extends java.util.EventListener> listenerClass) {}
+        });
         List<String> configLocations = new java.util.ArrayList<>(java.util.Arrays.asList(
             "classpath:applicationContext-service.xml",
             "classpath*:TestingApplicationContext.xml",
