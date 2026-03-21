@@ -33,12 +33,6 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
     @Parameter(defaultValue = "${project}", required = true, readonly = true)
     private MavenProject project;
 
-    @Parameter(defaultValue = "2.4.x", property = "openmrsVersion")
-    private String openmrsVersion;
-
-    @Parameter(property = "scanPackages")
-    private List<String> scanPackages;
-
     @Parameter(property = "autoDetectResources", defaultValue = "true")
     private boolean autoDetectResources;
 
@@ -63,10 +57,8 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         log.debug("Project: {}", project.getName());
         log.debug("Output directory: {}", getOutputDirectory());
 
-        prepareScanPackages();
         prepareOutputDirectory();
 
-        log.info("Generating OpenAPI specification for OpenMRS version: {}", openmrsVersion);
         runGeneratorDirectly();
 
         try {
@@ -77,23 +69,6 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
 
         log.info("Representation analysis completed successfully");
         log.info("==============================");
-    }
-
-    private void prepareScanPackages() {
-        if (autoDetectResources && (scanPackages == null || scanPackages.isEmpty())) {
-            scanPackages = ModuleClasspathBuilder.detectResourcePackages(project);
-            log.info("Auto-detected resource packages: {}", scanPackages);
-        } else if (scanPackages != null && !scanPackages.isEmpty()) {
-            log.info("Using configured scan packages: {}", scanPackages);
-        } else {
-            log.warn("No scan packages specified and auto-detection disabled. May not find resources.");
-            scanPackages = new ArrayList<>();
-        }
-
-        File outputDir = new File(getOutputDirectory());
-        if (!outputDir.exists()) {
-            outputDir.mkdirs();
-        }
     }
 
     private void prepareOutputDirectory() {
@@ -156,21 +131,11 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         log.debug("Isolated URLClassLoader: {} plugin URLs + {} module URLs",
                 pluginUrls.length, moduleUrls.length);
 
-        // 4. Set system properties (previously passed as -D flags to the forked JVM)
         System.setProperty("useInMemoryDatabase", "true");
-        System.setProperty("databaseUrl", "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1");
-        System.setProperty("databaseDriver", "org.h2.Driver");
-        System.setProperty("databaseUsername", "sa");
-        System.setProperty("databasePassword", "");
         System.setProperty("java.awt.headless", "true");
-        System.setProperty("target.module.groupId", project.getGroupId());
-        System.setProperty("target.module.artifactId", project.getArtifactId());
-        System.setProperty("target.module.version", project.getVersion());
-        System.setProperty("target.module.packages", String.join(",", scanPackages));
         System.setProperty("target.module.classesDir", project.getBuild().getOutputDirectory());
         System.setProperty("analysisOutputDir", getOutputDirectory());
         System.setProperty("analysisOutputFile", getOutputFileName());
-        System.setProperty("openmrs.version", openmrsVersion);
 
         ClassLoader originalClassLoader = Thread.currentThread().getContextClassLoader();
         // Use the system classloader as parent so JDK platform modules (java.sql, etc.) are
