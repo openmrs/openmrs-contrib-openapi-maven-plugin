@@ -196,7 +196,11 @@ public class CustomModelResolver extends ModelResolver {
           objectSchema.addRequiredItem(propertyName);
         }
       } catch (IllegalAccessException | InvocationTargetException | NoSuchMethodException | RuntimeException e1) {
-        log.warn("Error getting type of property: " + getResourceName(handler) + "." + propertyName, e1);
+        if(write) {
+          log.warn("Error getting schema for writable property: " + getResourceName(handler) + "." + propertyName);
+        } else {
+          log.warn("Error getting schema for readableproperty: " + getResourceName(handler) + "." + propertyName);
+        }
       }
     }
 

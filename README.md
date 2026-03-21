@@ -33,16 +33,7 @@ Perfect for **automatic documentation generation**, **API discovery**, and **Ope
 
 ## Architecture
 
-### Forked Process Design
-```
-Maven Plugin (Lightweight)
-    ↓ Spawns
-Forked JVM (Full OpenMRS Context)
-    ↓ Analyzes
-REST Resource Handlers
-    ↓ Generates
-Structured JSON Analysis
-```
+The plugin runs the OpenAPI spec generator in-process using an isolated `URLClassLoader`. The classloader combines the plugin's own classpath (OpenMRS platform, Swagger, Spring, etc.) with the target module's compiled classes and test artifacts, using the JDK system classloader as parent to avoid exposing Maven internals. The generator is invoked via reflection to prevent class identity conflicts between the isolated loader and the plugin's ClassRealm.
 ## Sample Output
 
 ```json
@@ -123,12 +114,21 @@ mvn org.openmrs.plugin:openmrs-rest-analyzer:1.0.0-SNAPSHOT:analyze-representati
 # Check plugin dependencies
 mvn dependency:tree
 ```
-### Dependencies (Auto-Resolved)
-- OpenMRS API 2.4+
-- OpenMRS Web Services REST Module
-- Jackson 2.11+ (for JSON generation)
-- JUnit 4.12+ (for test execution)
-- H2 Database (for in-memory testing)
+### OpenMRS Dependencies
+
+The plugin declares several OpenMRS dependencies, each serving a specific purpose:
+
+| Dependency | Classifier | Why it's needed |
+|---|---|---|
+| `org.openmrs.web:openmrs-web` | — | Provides `openmrs-api` transitively; also puts `openmrs-servlet.xml` on the classpath, which is loaded by the Spring `XmlWebApplicationContext` during spec generation |
+| `org.openmrs.api:openmrs-api` | `tests` | Contains `TestUtil`, used to configure Hibernate runtime properties for the in-memory H2 database |
+| `org.openmrs.web:openmrs-web` | `tests` | Provides test Spring context XML files (e.g. `TestingApplicationContext.xml`) loaded during context startup |
+| `org.openmrs.test:openmrs-test` | — (pom) | Test infrastructure: brings in dbunit, H2, and related test utilities |
+| `org.openmrs.module:webservices.rest-omod-common` | — | Directly imported in plugin code (`RestService`, `DelegatingResourceHandler`, REST annotations, etc.) |
+| `org.openmrs.module:webservices.rest-omod-common` | `tests` | Provides test-scope Spring context XML for the REST module |
+| `org.openmrs.module:webservices.rest-omod` | — | Puts version-specific REST resources and converters (e.g. `ImplementationIdConverter2_0`) on the classpath so `RestService.initialize()` discovers all handlers |
+
+Note: `webservices.rest-omod` transitively depends on `webservices.rest-omod-common`, so the no-classifier `omod-common` entry is technically redundant at runtime — but it is kept explicit since the plugin code imports directly from it.
 
 ## Contributing
 
