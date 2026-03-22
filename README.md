@@ -31,6 +31,15 @@ This plugin automatically discovers and analyzes **all OpenMRS REST resource han
 
 Perfect for **automatic documentation generation**, **API discovery**, and **OpenMRS module analysis**.
 
+## How Schema Generation Mirrors the REST Module
+
+The generated schemas follow exactly how the OpenMRS REST module handles requests at runtime. The authoritative reference is the [High Level Overview of REST Request Handling](https://openmrs.atlassian.net/wiki/spaces/projects/pages/263323664/Enhancing+OpenAPI+Documentation+Generation) on the OpenMRS wiki. In summary:
+
+1. For each resource, `getRepresentationDescription()` is called for the standard representations (`default`, `full`, `ref`). Each non-null result becomes a `ResourceGet_<rep>` schema.
+2. If `getRepresentationDescription()` returns null for a representation, the plugin looks for a method annotated with `@RepHandler` to handle it — exactly as `BaseDelegatingResource.findAnnotatedMethodForRepresentation()` does at runtime. Each such method produces a `ResourceGet_<repName>` schema.
+3. `getCreatableProperties()` produces a `ResourceCreate` schema; `getUpdatableProperties()` produces a `ResourceUpdate` schema.
+4. All GET schemas are grouped under an intermediary `ResourceGet` schema (`anyOf`), and the top-level `Resource` schema is `anyOf: [ResourceGet, ResourceCreate, ResourceUpdate]`.
+
 ## Architecture
 
 The plugin runs the OpenAPI spec generator in-process using an isolated `URLClassLoader`. The classloader combines the plugin's own classpath (OpenMRS platform, Swagger, Spring, etc.) with the target module's compiled classes and test artifacts, using the JDK system classloader as parent to avoid exposing Maven internals. The generator is invoked via reflection to prevent class identity conflicts between the isolated loader and the plugin's ClassRealm.
@@ -120,15 +129,13 @@ The plugin declares several OpenMRS dependencies, each serving a specific purpos
 
 | Dependency | Classifier | Why it's needed |
 |---|---|---|
-| `org.openmrs.web:openmrs-web` | — | Provides `openmrs-api` transitively; also puts `openmrs-servlet.xml` on the classpath, which is loaded by the Spring `XmlWebApplicationContext` during spec generation |
-| `org.openmrs.api:openmrs-api` | `tests` | Contains `TestUtil`, used to configure Hibernate runtime properties for the in-memory H2 database |
+| `org.openmrs.web:openmrs-web` | — | Provides `openmrs-api` transitively; also puts `openmrs-servlet.xml` on the classpath, loaded by the Spring `XmlWebApplicationContext` during spec generation |
 | `org.openmrs.web:openmrs-web` | `tests` | Provides test Spring context XML files (e.g. `TestingApplicationContext.xml`) loaded during context startup |
 | `org.openmrs.test:openmrs-test` | — (pom) | Test infrastructure: brings in dbunit, H2, and related test utilities |
 | `org.openmrs.module:webservices.rest-omod-common` | — | Directly imported in plugin code (`RestService`, `DelegatingResourceHandler`, REST annotations, etc.) |
 | `org.openmrs.module:webservices.rest-omod-common` | `tests` | Provides test-scope Spring context XML for the REST module |
-| `org.openmrs.module:webservices.rest-omod` | — | Puts version-specific REST resources and converters (e.g. `ImplementationIdConverter2_0`) on the classpath so `RestService.initialize()` discovers all handlers |
 
-Note: `webservices.rest-omod` transitively depends on `webservices.rest-omod-common`, so the no-classifier `omod-common` entry is technically redundant at runtime — but it is kept explicit since the plugin code imports directly from it.
+The target module's own classes (including version-specific REST resources) are loaded at runtime from the module's build output directory, not bundled into the plugin.
 
 ## Contributing
 

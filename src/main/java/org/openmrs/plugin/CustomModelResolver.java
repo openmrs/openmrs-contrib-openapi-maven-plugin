@@ -18,7 +18,16 @@ import org.openmrs.module.webservices.rest.SimpleObject;
 import org.openmrs.module.webservices.rest.util.ReflectionUtil;
 import org.openmrs.module.webservices.rest.web.annotation.RepHandler;
 import org.openmrs.module.webservices.rest.web.representation.Representation;
+import org.openmrs.module.webservices.rest.web.resource.api.Creatable;
+import org.openmrs.module.webservices.rest.web.resource.api.Deletable;
+import org.openmrs.module.webservices.rest.web.resource.api.Listable;
+import org.openmrs.module.webservices.rest.web.resource.api.Purgeable;
 import org.openmrs.module.webservices.rest.web.resource.api.Resource;
+import org.openmrs.module.webservices.rest.web.resource.api.Retrievable;
+import org.openmrs.module.webservices.rest.web.resource.api.Searchable;
+import org.openmrs.module.webservices.rest.web.resource.api.SubResource;
+import org.openmrs.module.webservices.rest.web.resource.api.Updatable;
+import org.openmrs.module.webservices.rest.web.resource.api.Uploadable;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceDescription;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
 import org.openmrs.module.webservices.rest.web.response.ResourceDoesNotSupportOperationException;
@@ -42,6 +51,11 @@ public class CustomModelResolver extends ModelResolver {
 
   public static final Representation[] STANDARD_REPRESENTATIONS = {Representation.DEFAULT, Representation.FULL, Representation.REF};
 
+  private static final List<Class<?>> ABILITY_INTERFACES = java.util.Arrays.asList(
+      Retrievable.class, Creatable.class, Updatable.class, Deletable.class,
+      Searchable.class, Listable.class, Purgeable.class, Uploadable.class, SubResource.class
+  );
+
   public CustomModelResolver(ObjectMapper mapper) {
     super(mapper);
   }
@@ -52,19 +66,66 @@ public class CustomModelResolver extends ModelResolver {
         OpenmrsResourceAnnotatedType<?> omrsType = (OpenmrsResourceAnnotatedType<?>) type;
         DelegatingResourceHandler<?> handler = omrsType.getHandler();
 
-        List<Schema<?>> representationSchemas = resolveRepresentationSchemasForResource(omrsType, context, chain);
-        // create a combined Schema that can be anyOf the representation schemas
-        ObjectSchema combinedSchema = new ObjectSchema();
-        for(Schema<?> repSchema: representationSchemas) {
-          combinedSchema.addAnyOfItem(repSchema);
+        List<Schema<?>> getSchemas = new ArrayList<>();
+        List<Schema<?>> writeSchemas = new ArrayList<>();
+        for (Schema<?> s : resolveRepresentationSchemasForResource(omrsType, context, chain)) {
+          if (s.getName() != null && s.getName().contains("Get_")) {
+            getSchemas.add(s);
+          } else {
+            writeSchemas.add(s);
+          }
         }
 
-        combinedSchema.setDescription("One of the supported representations for " + getResourceName(handler));
+        String resourceName = getResourceName(handler);
+        ObjectSchema combinedSchema = new ObjectSchema();
+        combinedSchema.setDescription("One of the supported representations for " + resourceName);
+
+        List<String> abilities = new ArrayList<>();
+        for (Class<?> ability : ABILITY_INTERFACES) {
+          if (ability.isAssignableFrom(handler.getClass())) {
+            abilities.add(ability.getSimpleName());
+          }
+        }
+        combinedSchema.addExtension("x-openmrs-abilities", abilities);
+
+        // Build intermediary ResourceGet schema as anyOf of all ResourceGet_* schemas
+        if (!getSchemas.isEmpty()) {
+          ObjectSchema getSchema = new ObjectSchema();
+          getSchema.name(resourceName + "Get");
+          for (Schema<?> s : getSchemas) {
+            context.defineModel(s.getName(), s);
+            Schema<?> ref = new Schema<>();
+            ref.$ref("#/schemas/" + s.getName());
+            getSchema.addAnyOfItem(ref);
+          }
+          context.defineModel(getSchema.getName(), getSchema);
+          Schema<?> getRef = new Schema<>();
+          getRef.$ref("#/schemas/" + getSchema.getName());
+          combinedSchema.addAnyOfItem(getRef);
+        }
+
+        // Add write schemas (ResourceCreate, ResourceUpdate) directly
+        for (Schema<?> s : writeSchemas) {
+          context.defineModel(s.getName(), s);
+          Schema<?> ref = new Schema<>();
+          ref.$ref("#/schemas/" + s.getName());
+          combinedSchema.addAnyOfItem(ref);
+        }
+
         return combinedSchema;
       }
-      else {
-        return super.resolve(type, context, chain);
+
+      // SimpleObject is a LinkedHashMap<String, Object>. The default Jackson resolver
+      // maps Object values to {"type": "object"} in additionalProperties, but SimpleObject
+      // values can be any JSON type (strings, dates, booleans, nested objects, etc.).
+      if (type.getType() != null
+              && SimpleObject.class.isAssignableFrom(TypeFactory.rawClass(type.getType()))) {
+        ObjectSchema schema = new ObjectSchema();
+        schema.additionalProperties(Boolean.TRUE);
+        return schema;
       }
+
+      return super.resolve(type, context, chain);
   }
 
   /**
@@ -92,7 +153,7 @@ public class CustomModelResolver extends ModelResolver {
         Schema<?> repResourceSchema = resolveSchemaForResourceDescription(handler, desc, false, context, chain);
         if (repResourceSchema != null) {
           repResourceSchema.addExtension("x-openmrs-representation", rep.getRepresentation());
-          repResourceSchema.name(getResourceName(handler) + StringUtils.capitalize(rep.getRepresentation()));
+          repResourceSchema.name(getResourceName(handler) + "Get_" + rep.getRepresentation());
           ret.add(repResourceSchema);
           generatedReps.add(rep.getRepresentation());
         }
@@ -101,14 +162,34 @@ public class CustomModelResolver extends ModelResolver {
       }
     }
 
-    // scan through methods in handler and look for ones with @RepHandler annotation
+    // scan through methods in handler and look for ones with @RepHandler annotation.
+    // mirrors BaseDelegatingResource.asRepresentation(): @RepHandler is only used when
+    // getRepresentationDescription() returns null for the representation it covers.
     Method[] methods = handler.getClass().getMethods();
     for (Method method : methods) {
       RepHandler repHandler = method.getAnnotation(RepHandler.class);
       if(repHandler != null) {
-        String repName = repHandler.name();
+        String repName = getRepHandlerName(repHandler);
+        if(generatedReps.contains(repName)) {
+          continue;
+        }
+        // skip @RepHandler methods for representations already covered by getRepresentationDescription()
+        boolean alreadyCovered = false;
+        for (Representation standardRep : STANDARD_REPRESENTATIONS) {
+          if (repHandler.value().isAssignableFrom(standardRep.getClass())) {
+            try {
+              if (handler.getRepresentationDescription(standardRep) != null) {
+                alreadyCovered = true;
+                break;
+              }
+            } catch (RuntimeException ignored) {}
+          }
+        }
+        if (alreadyCovered) continue;
+
         Schema<?> repResourceSchema = resolve(new AnnotatedType(method.getGenericReturnType()), context, chain);
-        repResourceSchema.name(getResourceName(handler) + StringUtils.capitalize(repName));
+        repResourceSchema.addExtension("x-openmrs-representation", repName);
+        repResourceSchema.name(getResourceName(handler) + "Get_" + repName);
         ret.add(repResourceSchema);
         generatedReps.add(repName);
       }
@@ -353,7 +434,8 @@ public class CustomModelResolver extends ModelResolver {
 
   public static String getResourceSpecFilename(Type delegateType, Representation rep) {
     Class<?> rawClass = TypeFactory.rawClass(delegateType);
-    return "./types/" + rawClass.getSimpleName() + StringUtils.capitalize(rep.getRepresentation()) + ".json";
+    String resourceName = rawClass.getSimpleName();
+    return "./" + resourceName + ".json#/schemas/" + resourceName + "Get_" + rep.getRepresentation();
   }
 
   public static String getResourceName(DelegatingResourceHandler<?> handler) {
@@ -371,6 +453,24 @@ public class CustomModelResolver extends ModelResolver {
    */
   private boolean isOpenmrsObject(Type t) {
     return OpenmrsObject.class.isAssignableFrom(TypeFactory.rawClass(t));
+  }
+
+  /**
+   * Returns the representation name for a @RepHandler annotation.
+   * If the annotation has an explicit name(), use it.
+   * Otherwise instantiate value() with its no-arg constructor and call getRepresentation()
+   * (e.g. FullRepresentation -> "full").
+   */
+  private static String getRepHandlerName(RepHandler repHandler) {
+    if (!repHandler.name().isEmpty()) {
+      return repHandler.name();
+    }
+    try {
+      return repHandler.value().getDeclaredConstructor().newInstance().getRepresentation();
+    } catch (NoSuchMethodException | InstantiationException | IllegalAccessException | InvocationTargetException e) {
+      log.warn("Could not determine representation name for @RepHandler {}", repHandler.value().getName(), e);
+      return "unknown";
+    }
   }
 
   private boolean isCollection(Type t) {

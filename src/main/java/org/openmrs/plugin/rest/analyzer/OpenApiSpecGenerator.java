@@ -46,7 +46,6 @@ import org.openmrs.module.webservices.rest.web.resource.api.Uploadable;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
 import org.openmrs.plugin.CustomModelResolver;
 import org.openmrs.plugin.OpenmrsResourceAnnotatedType;
-import org.openmrs.test.TestUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.mock.web.MockServletContext;
@@ -76,7 +75,7 @@ public class OpenApiSpecGenerator {
         final String h2Url = "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000;IGNORECASE=TRUE;NON_KEYWORDS=VALUE,KEY,NAME,TYPE";
 
         // Step 2: Configure Hibernate runtime properties
-        Properties props = TestUtil.getRuntimeProperties("openmrs");
+        Properties props = new Properties();
         props.setProperty(Environment.DIALECT, H2Dialect.class.getName());
         props.setProperty(Environment.URL, h2Url);
         props.setProperty(Environment.DRIVER, "org.h2.Driver");
