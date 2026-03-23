@@ -28,6 +28,7 @@ import org.openmrs.module.webservices.rest.web.resource.api.Searchable;
 import org.openmrs.module.webservices.rest.web.resource.api.SubResource;
 import org.openmrs.module.webservices.rest.web.resource.api.Updatable;
 import org.openmrs.module.webservices.rest.web.resource.api.Uploadable;
+import org.openmrs.module.webservices.rest.web.resource.impl.DataDelegatingCrudResource;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceDescription;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
 import org.openmrs.module.webservices.rest.web.response.ResourceDoesNotSupportOperationException;
@@ -187,7 +188,7 @@ public class CustomModelResolver extends ModelResolver {
         }
         if (alreadyCovered) continue;
 
-        Schema<?> repResourceSchema = resolve(new AnnotatedType(method.getGenericReturnType()), context, chain);
+        Schema<?> repResourceSchema = resolveSchemaForRepHandlerMethod(method, handler, context, chain);
         repResourceSchema.addExtension("x-openmrs-representation", repName);
         repResourceSchema.name(getResourceName(handler) + "Get_" + repName);
         ret.add(repResourceSchema);
@@ -319,7 +320,9 @@ public class CustomModelResolver extends ModelResolver {
         // models BaseDelegatingConverter.setProperty()
         Method annotatedSetter = ReflectionUtil.findPropertySetterMethod(handler, delegateProperty);
         if (annotatedSetter != null) {
-          propertyType = annotatedSetter.getGenericReturnType();
+          // @PropertySetter methods have signature: setter(T instance, V value) — the value type
+          // is the second parameter. getGenericReturnType() would give void, which is wrong.
+          propertyType = annotatedSetter.getGenericParameterTypes()[1];
         }
         else {
           PropertyDescriptor propertyDescriptor = getPropertyDescriptor(handler, delegateProperty);
@@ -345,12 +348,30 @@ public class CustomModelResolver extends ModelResolver {
     }
 
     if(isOpenmrsObject(propertyType)) {
-      return getRefSchemaForResource(propertyType, rep);
+      if(write) {
+        // In create/update operations, other resources are referenced by UUID string only.
+        // The REST module's ConversionUtil.convert() accepts a UUID string and resolves the entity.
+        // (Confirmed by getCREATEModel() implementations which use StringProperty().example("uuid"))
+        return uuidRefSchema(propertyType);
+      }
+      // `rep` reflects the Representation passed to DelegatingResourceDescription.addProperty(name, rep)
+      // in the resource's getRepresentationDescription(). In practice it is never null: the no-rep
+      // overload addProperty(String) passes null, which DelegatingResourceDescription normalizes to
+      // Representation.DEFAULT (DelegatingResourceDescription line 85: `if (rep == null) rep = DEFAULT`).
+      // Resources that nest other resources typically use Representation.REF for their default
+      // representation (e.g. VisitResource1_9: addProperty("patient", Representation.REF)) and
+      // Representation.DEFAULT for full (e.g. addProperty("encounters", Representation.DEFAULT)).
+      // The DEFAULT fallback below is defensive and in practice never reached.
+      return getRefSchemaForResource(propertyType, rep != null ? rep : Representation.DEFAULT);
     } else if(isCollection(propertyType)) {
       Type itemType = TypeFactory.defaultInstance().constructCollectionType(java.util.List.class, TypeFactory.defaultInstance().constructType(propertyType).getContentType()).getContentType();
       if(isOpenmrsObject(itemType)) {
         ArraySchema arraySchema = new ArraySchema();
-        arraySchema.items(getRefSchemaForResource(itemType, rep));
+        if(write) {
+          arraySchema.items(uuidRefSchema(itemType));
+        } else {
+          arraySchema.items(getRefSchemaForResource(itemType, rep != null ? rep : Representation.DEFAULT));
+        }
         return arraySchema;
       } else {
         return resolve(new AnnotatedType(itemType), context, chain);
@@ -426,6 +447,18 @@ public class CustomModelResolver extends ModelResolver {
 		return null;
 	}
 
+  /**
+   * Returns a schema for a UUID string field that references another REST resource.
+   * Uses {type: string, description: "UUID of <ResourceName>", x-openmrs-resource: "<ResourceName>"}
+   * so both human readers and tooling can identify which resource the UUID points to.
+   */
+  private static Schema<?> uuidRefSchema(Type delegateType) {
+    String resourceName = TypeFactory.rawClass(delegateType).getSimpleName();
+    Schema<?> schema = new Schema<>().type("string").description("UUID of " + resourceName).format("uuid");
+    schema.addExtension("x-openmrs-resource", resourceName);
+    return schema;
+  }
+
   private Schema<?> getRefSchemaForResource(Type delegateType, Representation rep) {
     Schema<?> ret = new Schema<>();
     ret.$ref(getResourceSpecFilename(delegateType, rep));
@@ -456,6 +489,39 @@ public class CustomModelResolver extends ModelResolver {
   }
 
   /**
+   * Resolves the schema for a @RepHandler-annotated method.
+   *
+   * Normally we resolve the method's return type, but DataDelegatingCrudResource.asRef() is a
+   * special case: its return type is SimpleObject (which gives us no field information), yet its
+   * body builds a well-known, fixed DelegatingResourceDescription with exactly three fields —
+   * uuid, display, and voided (the last added only when the delegate is voided). Because the
+   * description is constructed inside the method body at runtime (not visible to the type system),
+   * reflection on the return type alone cannot recover it. We therefore hard-code the description
+   * here. This special case must be updated if asRef() is ever changed in the REST module.
+   *
+   * For all other @RepHandler methods, the return type is resolved normally.
+   *
+   * TODO: Change DataDelegatingCrudResource.asRef() in the REST module to return a properly typed
+   * object (e.g. a dedicated RefRepresentation class with uuid, display, voided fields) instead of
+   * SimpleObject. That would let us derive the schema from the return type like any other method,
+   * eliminating this special case entirely.
+   */
+  private Schema<?> resolveSchemaForRepHandlerMethod(Method method, DelegatingResourceHandler<?> handler,
+      ModelConverterContext context, Iterator<ModelConverter> chain) {
+    if (DataDelegatingCrudResource.class.equals(method.getDeclaringClass())
+        && "asRef".equals(method.getName())) {
+      DelegatingResourceDescription description = new DelegatingResourceDescription();
+      description.addProperty("uuid");
+      description.addProperty("display");
+      description.addProperty("voided");
+      description.addSelfLink();
+      Schema<?> schema = resolveSchemaForResourceDescription(handler, description, false, context, chain);
+      return schema != null ? schema : new ObjectSchema().additionalProperties(Boolean.TRUE);
+    }
+    return resolve(new AnnotatedType(method.getGenericReturnType()), context, chain);
+  }
+
+  /**
    * Returns the representation name for a @RepHandler annotation.
    * If the annotation has an explicit name(), use it.
    * Otherwise instantiate value() with its no-arg constructor and call getRepresentation()
@@ -471,6 +537,24 @@ public class CustomModelResolver extends ModelResolver {
       log.warn("Could not determine representation name for @RepHandler {}", repHandler.value().getName(), e);
       return "unknown";
     }
+  }
+
+  /**
+   * Returns the REST path for a resource handler by reading the name() field of its
+   * {@code @Resource} annotation (e.g. "v1/visit" → "/ws/rest/v1/visit").
+   * Falls back to lowercasing the resource name if no annotation is found.
+   */
+  public static String getResourceRestPath(DelegatingResourceHandler<?> handler) {
+    Class<?> cls = handler.getClass();
+    while (cls != null) {
+      org.openmrs.module.webservices.rest.web.annotation.Resource ann =
+          cls.getAnnotation(org.openmrs.module.webservices.rest.web.annotation.Resource.class);
+      if (ann != null && !ann.name().isEmpty()) {
+        return "/ws/rest/" + ann.name();
+      }
+      cls = cls.getSuperclass();
+    }
+    return "/ws/rest/v1/" + getResourceName(handler).toLowerCase();
   }
 
   private boolean isCollection(Type t) {

@@ -56,9 +56,19 @@ import io.swagger.v3.core.converter.ResolvedSchema;
 import io.swagger.v3.core.util.Json31;
 import io.swagger.v3.oas.models.Components;
 import io.swagger.v3.oas.models.OpenAPI;
+import io.swagger.v3.oas.models.Operation;
+import io.swagger.v3.oas.models.PathItem;
 import io.swagger.v3.oas.models.SpecVersion;
 import io.swagger.v3.oas.models.info.Info;
+import io.swagger.v3.oas.models.media.ArraySchema;
+import io.swagger.v3.oas.models.media.Content;
+import io.swagger.v3.oas.models.media.MediaType;
+import io.swagger.v3.oas.models.media.ObjectSchema;
 import io.swagger.v3.oas.models.media.Schema;
+import io.swagger.v3.oas.models.parameters.Parameter;
+import io.swagger.v3.oas.models.parameters.RequestBody;
+import io.swagger.v3.oas.models.responses.ApiResponse;
+import io.swagger.v3.oas.models.responses.ApiResponses;
 
 /**
  * OpenAPI 3.1 specification generator for OpenMRS REST resources.
@@ -201,32 +211,45 @@ public class OpenApiSpecGenerator {
             throw new RuntimeException("Unable to create schema output directory: " + schemaDir, e);
         }
 
+        com.fasterxml.jackson.databind.ObjectMapper swaggerMapper = io.swagger.v3.core.util.Json.mapper();
+
         for (DelegatingResourceHandler<?> handler : handlers) {
             String resourceName = CustomModelResolver.getResourceName(handler);
             log.info("generating " + resourceName);
             ResolvedSchema resolvedSchema = converters.resolveAsResolvedSchema(new OpenmrsResourceAnnotatedType(handler.getClass(), handler));
 
-            // write main schema to its own file
+            // Collect schemas for this resource
             Components resourceComponents = new Components();
             resourceComponents.addSchemas(resourceName, resolvedSchema.schema);
-
             if (resolvedSchema.referencedSchemas != null) {
                 resolvedSchema.referencedSchemas.forEach(resourceComponents::addSchemas);
             }
 
-            String singleJson = io.swagger.v3.core.util.Json.pretty(resourceComponents);
+            // Build paths for this resource
+            io.swagger.v3.oas.models.Paths resourcePaths = new io.swagger.v3.oas.models.Paths();
+            addPathsForHandler(handler, resourceName, resourcePaths);
+
+            // Write per-resource file: { "schemas": {...}, "paths": {...} }
+            com.fasterxml.jackson.databind.node.ObjectNode root = swaggerMapper.createObjectNode();
+            com.fasterxml.jackson.databind.JsonNode componentsJson = swaggerMapper.valueToTree(resourceComponents);
+            if (componentsJson.has("schemas")) {
+                root.set("schemas", componentsJson.get("schemas"));
+            }
+            if (!resourcePaths.isEmpty()) {
+                root.set("paths", swaggerMapper.valueToTree(resourcePaths));
+            }
             Path outFile = schemaDir.resolve(resourceName + ".json");
             try {
-                Files.write(outFile, singleJson.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                Files.write(outFile, swaggerMapper.writerWithDefaultPrettyPrinter()
+                    .writeValueAsBytes(root));
             } catch (IOException e) {
                 e.printStackTrace();
             }
             System.out.println("Wrote schema file: " + outFile.toAbsolutePath());
 
-            // In main components keep only $ref placeholders to the external file
+            // In main openapi.json components keep only $ref placeholders to the external file
             Schema<Object> refSchema = new Schema<>();
-            String refPath = "./generated-schemas/" + resourceName + ".json#/components/schemas/" + resourceName;
-            refSchema.$ref(refPath);
+            refSchema.$ref("./generated-schemas/" + resourceName + ".json#/schemas/" + resourceName);
             components.addSchemas(resourceName, refSchema);
         }
 
@@ -242,6 +265,130 @@ public class OpenApiSpecGenerator {
         } catch (Exception e) {
             throw new RuntimeException("Unable to write OpenAPI output: " + openApiOut, e);
         }
+    }
+
+    /**
+     * Builds OpenAPI PathItem objects for a resource and adds them to the Paths map.
+     * Mirrors the dispatch logic in MainResourceController: each ability interface
+     * corresponds to specific HTTP routes.
+     */
+    private static void addPathsForHandler(DelegatingResourceHandler<?> handler, String resourceName, io.swagger.v3.oas.models.Paths paths) {
+        String restPath = CustomModelResolver.getResourceRestPath(handler);
+        // $ref prefix pointing from openapi.json into the per-resource schema file
+        String schemaRef = "./generated-schemas/" + resourceName + ".json#/schemas/";
+
+        // ---- Collection path (no UUID): GET list/search, POST create/upload ----
+        PathItem collectionItem = new PathItem();
+
+        if (handler instanceof Listable || handler instanceof Searchable) {
+            String summary = (handler instanceof Listable && handler instanceof Searchable)
+                ? "List or search " + resourceName + " resources"
+                : handler instanceof Listable ? "List all " + resourceName + " resources"
+                                              : "Search " + resourceName + " resources";
+            Schema<?> resultItems = new Schema<>().$ref(schemaRef + resourceName + "Get_ref");
+            Schema<?> responseBody = new ObjectSchema()
+                .addProperty("results", new ArraySchema().items(resultItems))
+                .addProperty("links", new ArraySchema().items(new ObjectSchema()));
+            collectionItem.get(new Operation()
+                .summary(summary)
+                .addParametersItem(vParam())
+                .responses(new ApiResponses().addApiResponse("200",
+                    new ApiResponse().description("Success").content(jsonContent(responseBody)))));
+        }
+
+        // Creatable and Uploadable both map to POST on the collection path.
+        // Combine them into one operation with multiple accepted content types.
+        boolean isCreatable = handler instanceof org.openmrs.module.webservices.rest.web.resource.api.Creatable;
+        if (isCreatable || handler instanceof Uploadable) {
+            String summary = isCreatable && handler instanceof Uploadable
+                ? "Create a new " + resourceName + " or upload a file"
+                : isCreatable ? "Create a new " + resourceName
+                              : "Upload a file for " + resourceName;
+            Content requestContent = new Content();
+            if (isCreatable) {
+                requestContent.addMediaType("application/json",
+                    new MediaType().schema(new Schema<>().$ref(schemaRef + resourceName + "Create")));
+            }
+            if (handler instanceof Uploadable) {
+                requestContent.addMediaType("multipart/form-data",
+                    new MediaType().schema(new ObjectSchema()
+                        .addProperty("file", new Schema<>().type("string").format("binary"))));
+            }
+            collectionItem.post(new Operation()
+                .summary(summary)
+                .requestBody(new RequestBody().required(true).content(requestContent))
+                .responses(new ApiResponses().addApiResponse("201",
+                    new ApiResponse().description("Created").content(
+                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get_default"))))));
+        }
+
+        if (collectionItem.readOperationsMap() != null && !collectionItem.readOperationsMap().isEmpty()) {
+            paths.addPathItem(restPath, collectionItem);
+        }
+
+        // ---- Instance path (with UUID): GET retrieve, POST update, DELETE void/purge ----
+        PathItem instanceItem = new PathItem();
+        Parameter uuidParam = new Parameter().name("uuid").in("path").required(true)
+            .description("UUID of the " + resourceName)
+            .schema(new Schema<>().type("string"));
+
+        if (handler instanceof Retrievable) {
+            instanceItem.get(new Operation()
+                .summary("Retrieve a " + resourceName + " by UUID")
+                .addParametersItem(uuidParam)
+                .addParametersItem(vParam())
+                .responses(new ApiResponses().addApiResponse("200",
+                    new ApiResponse().description("Success").content(
+                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get"))))));
+        }
+
+        if (handler instanceof Updatable) {
+            // The update endpoint also handles undelete when the body is {deleted: false}
+            instanceItem.post(new Operation()
+                .summary("Update a " + resourceName + " (send {deleted: false} to undelete)")
+                .addParametersItem(uuidParam)
+                .requestBody(new RequestBody().required(true).content(
+                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Update"))))
+                .responses(new ApiResponses().addApiResponse("200",
+                    new ApiResponse().description("Updated").content(
+                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get_default"))))));
+        }
+
+        if (handler instanceof Deletable || handler instanceof Purgeable) {
+            Operation deleteOp = new Operation()
+                .summary(handler instanceof Purgeable
+                    ? "Void, retire, or permanently purge a " + resourceName
+                    : "Void or retire a " + resourceName)
+                .addParametersItem(uuidParam);
+            if (handler instanceof Deletable) {
+                deleteOp.addParametersItem(new Parameter().name("reason").in("query")
+                    .description("Reason for voiding or retiring")
+                    .schema(new Schema<>().type("string")));
+            }
+            if (handler instanceof Purgeable) {
+                deleteOp.addParametersItem(new Parameter().name("purge").in("query")
+                    .description("Set to true to permanently delete instead of voiding or retiring")
+                    .schema(new Schema<>().type("boolean")));
+            }
+            deleteOp.responses(new ApiResponses().addApiResponse("204",
+                new ApiResponse().description("No Content")));
+            instanceItem.delete(deleteOp);
+        }
+
+        if (instanceItem.readOperationsMap() != null && !instanceItem.readOperationsMap().isEmpty()) {
+            paths.addPathItem(restPath + "/{uuid}", instanceItem);
+        }
+    }
+
+    private static Content jsonContent(Schema<?> schema) {
+        return new Content().addMediaType("application/json", new MediaType().schema(schema));
+    }
+
+    /** The ?v= representation query parameter, common to all GET operations. */
+    private static Parameter vParam() {
+        return new Parameter().name("v").in("query")
+            .description("The representation to return (ref, default, full, or custom)")
+            .schema(new Schema<>().type("string")._default("default"));
     }
 
     private static void loadDataSet(Connection conn, String path) throws Exception {
