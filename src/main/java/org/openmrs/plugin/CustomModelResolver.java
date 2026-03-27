@@ -31,6 +31,8 @@ import org.openmrs.module.webservices.rest.web.resource.api.Uploadable;
 import org.openmrs.module.webservices.rest.web.resource.impl.DataDelegatingCrudResource;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceDescription;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
+import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingSubResource;
+import org.openmrs.module.webservices.rest.web.resource.impl.MetadataDelegatingCrudResource;
 import org.openmrs.module.webservices.rest.web.response.ResourceDoesNotSupportOperationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -491,34 +493,46 @@ public class CustomModelResolver extends ModelResolver {
   /**
    * Resolves the schema for a @RepHandler-annotated method.
    *
-   * Normally we resolve the method's return type, but DataDelegatingCrudResource.asRef() is a
-   * special case: its return type is SimpleObject (which gives us no field information), yet its
-   * body builds a well-known, fixed DelegatingResourceDescription with exactly three fields —
-   * uuid, display, and voided (the last added only when the delegate is voided). Because the
-   * description is constructed inside the method body at runtime (not visible to the type system),
-   * reflection on the return type alone cannot recover it. We therefore hard-code the description
-   * here. This special case must be updated if asRef() is ever changed in the REST module.
+   * Normally we resolve the method's return type. However, three base-class REF handlers all
+   * return SimpleObject and build their DelegatingResourceDescription inside the method body,
+   * making it impossible to derive the schema from the return type alone:
    *
-   * For all other @RepHandler methods, the return type is resolved normally.
+   *   DataDelegatingCrudResource.asRef()          — uuid, display, voided (conditional), selfLink
+   *   MetadataDelegatingCrudResource.convertToRef()— uuid, display, retired (conditional), selfLink
+   *   DelegatingSubResource.asRef()               — uuid, display, voided (conditional), selfLink
    *
-   * TODO: Change DataDelegatingCrudResource.asRef() in the REST module to return a properly typed
-   * object (e.g. a dedicated RefRepresentation class with uuid, display, voided fields) instead of
+   * We hard-code the known descriptions for each. The voided/retired fields are conditional at
+   * runtime (only added when the delegate is voided/retired), but we always include them in the
+   * schema since a schema describes what the response MAY contain.
+   *
+   * TODO: Change these methods in the REST module to return a properly typed object instead of
    * SimpleObject. That would let us derive the schema from the return type like any other method,
-   * eliminating this special case entirely.
+   * eliminating these special cases entirely.
    */
   private Schema<?> resolveSchemaForRepHandlerMethod(Method method, DelegatingResourceHandler<?> handler,
       ModelConverterContext context, Iterator<ModelConverter> chain) {
-    if (DataDelegatingCrudResource.class.equals(method.getDeclaringClass())
-        && "asRef".equals(method.getName())) {
-      DelegatingResourceDescription description = new DelegatingResourceDescription();
-      description.addProperty("uuid");
-      description.addProperty("display");
-      description.addProperty("voided");
-      description.addSelfLink();
-      Schema<?> schema = resolveSchemaForResourceDescription(handler, description, false, context, chain);
-      return schema != null ? schema : new ObjectSchema().additionalProperties(Boolean.TRUE);
+    Class<?> declaring = method.getDeclaringClass();
+    if (DataDelegatingCrudResource.class.equals(declaring) && "asRef".equals(method.getName())) {
+      return hardCodedRefSchema(handler, "voided", context, chain);
+    }
+    if (MetadataDelegatingCrudResource.class.equals(declaring) && "convertToRef".equals(method.getName())) {
+      return hardCodedRefSchema(handler, "retired", context, chain);
+    }
+    if (DelegatingSubResource.class.equals(declaring) && "asRef".equals(method.getName())) {
+      return hardCodedRefSchema(handler, "voided", context, chain);
     }
     return resolve(new AnnotatedType(method.getGenericReturnType()), context, chain);
+  }
+
+  private Schema<?> hardCodedRefSchema(DelegatingResourceHandler<?> handler, String voidedOrRetired,
+      ModelConverterContext context, Iterator<ModelConverter> chain) {
+    DelegatingResourceDescription description = new DelegatingResourceDescription();
+    description.addProperty("uuid");
+    description.addProperty("display");
+    description.addProperty(voidedOrRetired);
+    description.addSelfLink();
+    Schema<?> schema = resolveSchemaForResourceDescription(handler, description, false, context, chain);
+    return schema != null ? schema : new ObjectSchema().additionalProperties(Boolean.TRUE);
   }
 
   /**
