@@ -60,6 +60,7 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
 
         try {
             processAnalysisResults();
+            bundleOutputIntoJar();
         } catch (IOException e) {
             throw new MojoExecutionException("Failed to process analysis results", e);
         }
@@ -196,5 +197,38 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         log.debug("Final output: {}", finalOutputFile.getAbsolutePath());
 
         log.debug("==============================");
+    }
+
+    /**
+     * Copies all generated OpenAPI files from target/openapi/ into
+     * target/classes/META-INF/openapi/ so they are included in the module JAR.
+     * The package phase runs after process-classes and picks up everything in target/classes/.
+     */
+    private void bundleOutputIntoJar() throws IOException {
+        java.nio.file.Path sourceDir = new File(getOutputDirectory()).toPath();
+        java.nio.file.Path targetDir = new File(
+                project.getBuild().getOutputDirectory(), "META-INF/openapi").toPath();
+
+        if (!sourceDir.toFile().exists()) {
+            log.warn("OpenAPI output directory does not exist, skipping JAR bundling: {}", sourceDir);
+            return;
+        }
+
+        Files.walk(sourceDir).forEach(source -> {
+            try {
+                java.nio.file.Path relative = sourceDir.relativize(source);
+                java.nio.file.Path dest = targetDir.resolve(relative);
+                if (Files.isDirectory(source)) {
+                    Files.createDirectories(dest);
+                } else {
+                    Files.createDirectories(dest.getParent());
+                    Files.copy(source, dest, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            } catch (IOException e) {
+                throw new RuntimeException("Failed to copy OpenAPI file into JAR: " + source, e);
+            }
+        });
+
+        log.info("Bundled OpenAPI specs into JAR at META-INF/openapi/");
     }
 }
