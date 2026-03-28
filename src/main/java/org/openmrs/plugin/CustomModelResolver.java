@@ -3,10 +3,12 @@ package org.openmrs.plugin;
 import java.beans.PropertyDescriptor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -16,6 +18,7 @@ import org.openmrs.ConceptDatatype;
 import org.openmrs.OpenmrsObject;
 import org.openmrs.module.webservices.rest.SimpleObject;
 import org.openmrs.module.webservices.rest.util.ReflectionUtil;
+import org.openmrs.module.webservices.rest.web.annotation.PropertyGetter;
 import org.openmrs.module.webservices.rest.web.annotation.RepHandler;
 import org.openmrs.module.webservices.rest.web.representation.Representation;
 import org.openmrs.module.webservices.rest.web.resource.api.Creatable;
@@ -198,7 +201,18 @@ public class CustomModelResolver extends ModelResolver {
       }
     }
 
-    // TODO: custom representations
+    // ========== CUSTOM representation ==========
+    try {
+      ObjectSchema customSchema = resolveCustomRepresentationSchema(handler, context, chain);
+      if (customSchema != null) {
+        customSchema.addExtension("x-openmrs-representation", "custom");
+        customSchema.name(getResourceName(handler) + "Get_custom");
+        ret.add(customSchema);
+        generatedReps.add("custom");
+      }
+    } catch (RuntimeException e) {
+      log.warn("Error generating custom representation schema for " + getResourceName(handler), e);
+    }
 
     // ========== CREATE representations ==========
     DelegatingResourceDescription createDesc = getCreateDescription(handler);
@@ -448,6 +462,114 @@ public class CustomModelResolver extends ModelResolver {
 		log.warn("Could not determine delegate type for " + resource.getClass().getName());
 		return null;
 	}
+
+  /**
+   * Discovers all properties accessible via a custom representation for this resource.
+   * Returns a map of property name to the Method that provides the value (either a
+   * @PropertyGetter on the handler or a JavaBean getter on the delegate). Keeping the Method
+   * lets resolveCustomRepresentationSchema check swagger annotations on the method.
+   *
+   * Custom representations go through BaseDelegatingConverter.getProperty(), which:
+   *   1. Checks for @PropertyGetter-annotated methods on the resource handler first
+   *   2. Falls back to PropertyUtils.getProperty(delegate, name) — JavaBean getters on the delegate
+   *
+   * This method discovers both, so the resulting schema covers everything a caller can request.
+   */
+  private <T> Map<String, Method> discoverCustomRepProperties(DelegatingResourceHandler<T> handler) {
+    Map<String, Method> properties = new LinkedHashMap<>();
+
+    Class<?> delegateType = getDelegateType(handler);
+    if (delegateType != null) {
+      // JavaBean getter-based properties on the delegate (the PropertyUtils fallback path)
+      for (PropertyDescriptor pd : PropertyUtils.getPropertyDescriptors(delegateType)) {
+        if ("class".equals(pd.getName()) || pd.getReadMethod() == null) continue;
+        Method readMethod = pd.getReadMethod();
+        if (Modifier.isPublic(readMethod.getModifiers()) && !Modifier.isStatic(readMethod.getModifiers())) {
+          properties.put(pd.getName(), readMethod);
+        }
+      }
+    }
+
+    // @PropertyGetter annotations on the resource handler hierarchy.
+    // These override delegate properties at runtime (checked first in getProperty()).
+    // Walk most-derived → base using putIfAbsent so the most-derived handler's getter wins.
+    Class<?> handlerClass = handler.getClass();
+    while (handlerClass != null && !handlerClass.equals(Object.class)) {
+      for (Method m : handlerClass.getDeclaredMethods()) {
+        PropertyGetter getter = m.getAnnotation(PropertyGetter.class);
+        if (getter != null) {
+          properties.putIfAbsent(getter.value(), m);
+        }
+      }
+      handlerClass = handlerClass.getSuperclass();
+    }
+
+    return properties;
+  }
+
+  /**
+   * Generates an ObjectSchema for the custom representation of the given resource.
+   * All properties are optional (the caller specifies any subset via ?v=custom:(...)).
+   * For sub-resource (OpenmrsObject) properties, defaults to REF representation since that is
+   * the most compact form; callers can request a different sub-rep per-property, e.g.
+   * {@code ?v=custom:(patient:default)}.
+   */
+  private <T> ObjectSchema resolveCustomRepresentationSchema(DelegatingResourceHandler<T> handler,
+      ModelConverterContext context, Iterator<ModelConverter> chain) {
+
+    Map<String, Method> props = discoverCustomRepProperties(handler);
+    if (props.isEmpty()) {
+      return null;
+    }
+
+    ObjectSchema schema = new ObjectSchema();
+    for (Map.Entry<String, Method> entry : props.entrySet()) {
+      String propName = entry.getKey();
+      Method method = entry.getValue();
+      Type propType = method.getGenericReturnType();
+      try {
+        Schema<?> propSchema;
+        if (isOpenmrsObject(propType)) {
+          propSchema = getRefSchemaForResource(propType, Representation.REF);
+        } else if (isCollection(propType)) {
+          ArraySchema arraySchema = new ArraySchema();
+          com.fasterxml.jackson.databind.JavaType itemJavaType =
+              TypeFactory.defaultInstance().constructType(propType).getContentType();
+          if (itemJavaType != null) {
+            if (isOpenmrsObject(itemJavaType)) {
+              arraySchema.items(getRefSchemaForResource(itemJavaType, Representation.REF));
+            } else {
+              Schema<?> itemSchema = resolve(new AnnotatedType(itemJavaType), context, chain);
+              if (itemSchema != null) arraySchema.items(itemSchema);
+            }
+          }
+          propSchema = arraySchema;
+        } else if (java.util.Map.class.isAssignableFrom(TypeFactory.rawClass(propType))) {
+          // Map types (e.g. Map<String, PersonAttribute>) must NOT go through super.resolve():
+          // Jackson would recursively resolve the value type as a full POJO, which cascades
+          // inline schema registration for PersonAttribute → Person → Concept → ...
+          ObjectSchema mapSchema = new ObjectSchema();
+          com.fasterxml.jackson.databind.JavaType valueJavaType =
+              TypeFactory.defaultInstance().constructType(propType).getContentType();
+          if (valueJavaType != null && isOpenmrsObject(valueJavaType)) {
+            mapSchema.additionalProperties(getRefSchemaForResource(valueJavaType, Representation.REF));
+          } else {
+            mapSchema.additionalProperties(Boolean.TRUE);
+          }
+          propSchema = mapSchema;
+        } else {
+          propSchema = resolve(new AnnotatedType(propType), context, chain);
+        }
+        if (propSchema != null) {
+          schema.addProperty(propName, propSchema);
+        }
+      } catch (RuntimeException e) {
+        log.warn("Error resolving schema for custom property {}.{}", getResourceName(handler), propName, e);
+      }
+    }
+
+    return schema.getProperties() != null && !schema.getProperties().isEmpty() ? schema : null;
+  }
 
   /**
    * Returns a schema for a UUID string field that references another REST resource.

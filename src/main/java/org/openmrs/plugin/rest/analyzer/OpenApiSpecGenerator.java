@@ -222,7 +222,14 @@ public class OpenApiSpecGenerator {
             Components resourceComponents = new Components();
             resourceComponents.addSchemas(resourceName, resolvedSchema.schema);
             if (resolvedSchema.referencedSchemas != null) {
-                resolvedSchema.referencedSchemas.forEach(resourceComponents::addSchemas);
+                // Only include schemas belonging to this resource (e.g. VisitGet_default, VisitCreate).
+                // CustomModelResolver may register orphaned schemas in the context as a side effect of
+                // calling super.resolve() on complex non-OpenmrsObject types (e.g. CodedOrFreeText,
+                // Allergen). Those schemas are redundant here because cross-resource references are
+                // expressed as $ref pointers to the owning resource's own JSON file, not inline copies.
+                resolvedSchema.referencedSchemas.entrySet().stream()
+                    .filter(e -> e.getKey().startsWith(resourceName))
+                    .forEach(e -> resourceComponents.addSchemas(e.getKey(), e.getValue()));
             }
 
             // Build paths for this resource
