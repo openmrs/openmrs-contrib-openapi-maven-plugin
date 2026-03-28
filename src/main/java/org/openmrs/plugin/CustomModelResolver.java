@@ -31,11 +31,8 @@ import org.openmrs.module.webservices.rest.web.resource.api.Searchable;
 import org.openmrs.module.webservices.rest.web.resource.api.SubResource;
 import org.openmrs.module.webservices.rest.web.resource.api.Updatable;
 import org.openmrs.module.webservices.rest.web.resource.api.Uploadable;
-import org.openmrs.module.webservices.rest.web.resource.impl.DataDelegatingCrudResource;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceDescription;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
-import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingSubResource;
-import org.openmrs.module.webservices.rest.web.resource.impl.MetadataDelegatingCrudResource;
 import org.openmrs.module.webservices.rest.web.response.ResourceDoesNotSupportOperationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -320,6 +317,8 @@ public class CustomModelResolver extends ModelResolver {
         // TODO: handle override, like UserResource1_8.getProperty()
         Method annotatedGetter = ReflectionUtil.findPropertyGetterMethod(handler, delegateProperty);
         if (annotatedGetter != null) {
+          Schema<?> annotationSchema = resolveSchemaFromSwaggerAnnotations(annotatedGetter, rep, context, chain);
+          if (annotationSchema != null) return annotationSchema;
           propertyType = annotatedGetter.getGenericReturnType();
         }
         else {
@@ -528,7 +527,13 @@ public class CustomModelResolver extends ModelResolver {
       Method method = entry.getValue();
       Type propType = method.getGenericReturnType();
       try {
-        Schema<?> propSchema;
+        // Check for swagger annotations on the method first — they take precedence over
+        // the declared return type (useful for @PropertyGetters returning Object).
+        Schema<?> propSchema = resolveSchemaFromSwaggerAnnotations(method, Representation.REF, context, chain);
+        if (propSchema != null) {
+          schema.addProperty(propName, propSchema);
+          continue;
+        }
         if (isOpenmrsObject(propType)) {
           propSchema = getRefSchemaForResource(propType, Representation.REF);
         } else if (isCollection(propType)) {
@@ -569,6 +574,81 @@ public class CustomModelResolver extends ModelResolver {
     }
 
     return schema.getProperties() != null && !schema.getProperties().isEmpty() ? schema : null;
+  }
+
+  /**
+   * Reads schema metadata from the @PropertyGetter fields on a getter method and builds the
+   * corresponding OpenAPI schema. Returns null when no schema hint is present, so the caller
+   * falls through to normal type-based resolution.
+   *
+   * Priority: arraySchema field > schema field. Within schema: implementation > anyOf/oneOf.
+   *
+   * Using fully qualified annotation names to avoid collision with io.swagger.v3.oas.models.media.Schema.
+   */
+  private Schema<?> resolveSchemaFromSwaggerAnnotations(Method getter, Representation propertyRep,
+      ModelConverterContext context, Iterator<ModelConverter> chain) {
+
+    PropertyGetter pg = getter.getAnnotation(PropertyGetter.class);
+    if (pg == null) return null;
+
+    // arraySchema field takes precedence
+    io.swagger.v3.oas.annotations.media.Schema itemAnn = pg.arraySchema().schema();
+    if (itemAnn.anyOf().length > 0 || itemAnn.oneOf().length > 0
+        || itemAnn.implementation() != Void.class) {
+      Schema<?> itemSchema = buildSchemaFromAnnotation(itemAnn, propertyRep, context, chain);
+      if (itemSchema != null) {
+        ArraySchema arr = new ArraySchema();
+        arr.items(itemSchema);
+        return arr;
+      }
+    }
+
+    // schema field
+    io.swagger.v3.oas.annotations.media.Schema schemaAnn = pg.schema();
+    if (schemaAnn.implementation() != Void.class
+        || schemaAnn.anyOf().length > 0 || schemaAnn.oneOf().length > 0) {
+      return buildSchemaFromAnnotation(schemaAnn, propertyRep, context, chain);
+    }
+
+    return null;
+  }
+
+  /**
+   * Builds an OpenAPI Schema from a @Schema annotation.
+   *
+   * - implementation: emits a cross-file $ref for OpenmrsObject types using propertyRep,
+   *   falling back to REF. For non-OpenmrsObject types, resolves normally.
+   * - anyOf / oneOf: builds an anyOf schema; OpenmrsObject items use propertyRep for their $ref,
+   *   everything else resolves normally.
+   */
+  private Schema<?> buildSchemaFromAnnotation(
+      io.swagger.v3.oas.annotations.media.Schema ann,
+      Representation propertyRep, ModelConverterContext context, Iterator<ModelConverter> chain) {
+
+    if (ann.implementation() != Void.class) {
+      Class<?> cls = ann.implementation();
+      if (isOpenmrsObject(cls)) {
+        return getRefSchemaForResource(cls, propertyRep != null ? propertyRep : Representation.REF);
+      }
+      return resolve(new AnnotatedType(cls), context, chain);
+    }
+
+    Class<?>[] types = ann.anyOf().length > 0 ? ann.anyOf() : ann.oneOf();
+    if (types.length == 0) return null;
+
+    @SuppressWarnings("rawtypes")
+    List<Schema> anyOfItems = new ArrayList<>();
+    for (Class<?> type : types) {
+      if (isOpenmrsObject(type)) {
+        anyOfItems.add(getRefSchemaForResource(type, propertyRep != null ? propertyRep : Representation.REF));
+      } else {
+        Schema<?> s = resolve(new AnnotatedType(type), context, chain);
+        if (s != null) anyOfItems.add(s);
+      }
+    }
+    Schema<Object> result = new Schema<>();
+    result.anyOf(anyOfItems);
+    return result;
   }
 
   /**
@@ -613,48 +693,11 @@ public class CustomModelResolver extends ModelResolver {
   }
 
   /**
-   * Resolves the schema for a @RepHandler-annotated method.
-   *
-   * Normally we resolve the method's return type. However, three base-class REF handlers all
-   * return SimpleObject and build their DelegatingResourceDescription inside the method body,
-   * making it impossible to derive the schema from the return type alone:
-   *
-   *   DataDelegatingCrudResource.asRef()          — uuid, display, voided (conditional), selfLink
-   *   MetadataDelegatingCrudResource.convertToRef()— uuid, display, retired (conditional), selfLink
-   *   DelegatingSubResource.asRef()               — uuid, display, voided (conditional), selfLink
-   *
-   * We hard-code the known descriptions for each. The voided/retired fields are conditional at
-   * runtime (only added when the delegate is voided/retired), but we always include them in the
-   * schema since a schema describes what the response MAY contain.
-   *
-   * TODO: Change these methods in the REST module to return a properly typed object instead of
-   * SimpleObject. That would let us derive the schema from the return type like any other method,
-   * eliminating these special cases entirely.
+   * Resolves the schema for a @RepHandler-annotated method by reflecting on its declared return type.
    */
   private Schema<?> resolveSchemaForRepHandlerMethod(Method method, DelegatingResourceHandler<?> handler,
       ModelConverterContext context, Iterator<ModelConverter> chain) {
-    Class<?> declaring = method.getDeclaringClass();
-    if (DataDelegatingCrudResource.class.equals(declaring) && "asRef".equals(method.getName())) {
-      return hardCodedRefSchema(handler, "voided", context, chain);
-    }
-    if (MetadataDelegatingCrudResource.class.equals(declaring) && "convertToRef".equals(method.getName())) {
-      return hardCodedRefSchema(handler, "retired", context, chain);
-    }
-    if (DelegatingSubResource.class.equals(declaring) && "asRef".equals(method.getName())) {
-      return hardCodedRefSchema(handler, "voided", context, chain);
-    }
     return resolve(new AnnotatedType(method.getGenericReturnType()), context, chain);
-  }
-
-  private Schema<?> hardCodedRefSchema(DelegatingResourceHandler<?> handler, String voidedOrRetired,
-      ModelConverterContext context, Iterator<ModelConverter> chain) {
-    DelegatingResourceDescription description = new DelegatingResourceDescription();
-    description.addProperty("uuid");
-    description.addProperty("display");
-    description.addProperty(voidedOrRetired);
-    description.addSelfLink();
-    Schema<?> schema = resolveSchemaForResourceDescription(handler, description, false, context, chain);
-    return schema != null ? schema : new ObjectSchema().additionalProperties(Boolean.TRUE);
   }
 
   /**
