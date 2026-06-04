@@ -9,8 +9,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 
 import java.net.URI;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
 import java.util.Map;
 import java.util.Set;
 
@@ -77,13 +75,7 @@ class VisitSchemaIT {
     }
 
     private static JsonNode get(String path) throws Exception {
-        HttpResponse<String> response = OpenMrsExtension.HTTP.send(
-                HttpRequest.newBuilder()
-                        .uri(URI.create(OpenMrsExtension.BASE_URL + path))
-                        .header("Authorization", OpenMrsExtension.AUTH_HEADER)
-                        .GET()
-                        .build(),
-                HttpResponse.BodyHandlers.ofString());
+        OpenMrsExtension.HttpResult response = OpenMrsExtension.get(OpenMrsExtension.BASE_URL + path);
         assertEquals(200, response.statusCode(),
                 "Unexpected HTTP status for GET " + path + ": " + response.body());
         return MAPPER.readTree(response.body());

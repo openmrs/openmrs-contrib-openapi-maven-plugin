@@ -110,12 +110,21 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         // 3. Combine: plugin JARs first (their versions take precedence), then module deps.
         // Deduplicate by filename to prevent the same JAR from being loaded twice
         // (e.g. omod-common.jar appears in both plugin ClassRealm and module test artifacts).
+        // Also exclude the old javax.servlet:servlet-api (pre-Servlet-3.0 naming) from pluginUrls:
+        // openmrs-web transitively pulls it in, but the plugin supplies javax.servlet:javax.servlet-api
+        // which must win — having both on the classpath causes NoSuchMethodError for Servlet 3+ methods.
         Set<String> pluginFileNames = new java.util.HashSet<>();
+        List<URL> allUrls = new ArrayList<>();
         for (URL url : pluginUrls) {
             String path = url.getPath();
-            pluginFileNames.add(path.substring(path.lastIndexOf('/') + 1));
+            String fileName = path.substring(path.lastIndexOf('/') + 1);
+            if (fileName.matches("servlet-api-.*\\.jar")) {
+                log.debug("Skipping old servlet-api JAR from plugin ClassRealm: {}", fileName);
+                continue;
+            }
+            pluginFileNames.add(fileName);
+            allUrls.add(url);
         }
-        List<URL> allUrls = new ArrayList<>(Arrays.asList(pluginUrls));
         for (URL moduleUrl : moduleUrls) {
             String path = moduleUrl.getPath();
             String fileName = path.substring(path.lastIndexOf('/') + 1);

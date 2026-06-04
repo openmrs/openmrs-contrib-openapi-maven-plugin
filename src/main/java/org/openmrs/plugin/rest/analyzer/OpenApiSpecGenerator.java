@@ -83,8 +83,7 @@ public class OpenApiSpecGenerator {
     public void setup(String moduleClassesDir) throws Exception {
         log.info("=== Setting up OpenAPI Spec Generator ===");
 
-        // NON_KEYWORDS=VALUE,KEY,NAME,TYPE: un-reserve H2 2.x keywords used as column names in OpenMRS HBM mappings
-        final String h2Url = "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000;IGNORECASE=TRUE;NON_KEYWORDS=VALUE,KEY,NAME,TYPE";
+        final String h2Url = "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000;IGNORECASE=TRUE";
 
         // Step 2: Configure Hibernate runtime properties
         Properties props = new Properties();
@@ -100,10 +99,10 @@ public class OpenApiSpecGenerator {
         // Use file: URL for webModuleApplicationContext.xml to load only the target module's own copy,
         // avoiding double-loading when both omod-common and omod are on the classpath.
         ctx = new XmlWebApplicationContext();
-        jakarta.servlet.FilterRegistration.Dynamic noopFilter = new jakarta.servlet.FilterRegistration.Dynamic() {
-            public void addMappingForServletNames(java.util.EnumSet<jakarta.servlet.DispatcherType> d, boolean b, String... names) {}
+        javax.servlet.FilterRegistration.Dynamic noopFilter = new javax.servlet.FilterRegistration.Dynamic() {
+            public void addMappingForServletNames(java.util.EnumSet<javax.servlet.DispatcherType> d, boolean b, String... names) {}
             public java.util.Collection<String> getServletNameMappings() { return java.util.Collections.emptyList(); }
-            public void addMappingForUrlPatterns(java.util.EnumSet<jakarta.servlet.DispatcherType> d, boolean b, String... patterns) {}
+            public void addMappingForUrlPatterns(java.util.EnumSet<javax.servlet.DispatcherType> d, boolean b, String... patterns) {}
             public java.util.Collection<String> getUrlPatternMappings() { return java.util.Collections.emptyList(); }
             public String getName() { return ""; }
             public String getClassName() { return ""; }
@@ -115,17 +114,27 @@ public class OpenApiSpecGenerator {
         };
         ctx.setServletContext(new MockServletContext() {
             @Override
-            public jakarta.servlet.FilterRegistration.Dynamic addFilter(String filterName, String className) { return noopFilter; }
+            public javax.servlet.FilterRegistration.Dynamic addFilter(String filterName, String className) { return noopFilter; }
             @Override
-            public jakarta.servlet.FilterRegistration.Dynamic addFilter(String filterName, jakarta.servlet.Filter filter) { return noopFilter; }
+            public javax.servlet.FilterRegistration.Dynamic addFilter(String filterName, javax.servlet.Filter filter) { return noopFilter; }
             @Override
-            public jakarta.servlet.FilterRegistration.Dynamic addFilter(String filterName, Class<? extends jakarta.servlet.Filter> filterClass) { return noopFilter; }
+            public javax.servlet.FilterRegistration.Dynamic addFilter(String filterName, Class<? extends javax.servlet.Filter> filterClass) { return noopFilter; }
             @Override
             public void addListener(String className) {}
             @Override
             public <T extends java.util.EventListener> void addListener(T t) {}
             @Override
             public void addListener(Class<? extends java.util.EventListener> listenerClass) {}
+            @Override
+            public javax.servlet.ServletRegistration getServletRegistration(String servletName) { return null; }
+            @Override
+            public javax.servlet.ServletRegistration.Dynamic addServlet(String servletName, String className) { return null; }
+            @Override
+            public javax.servlet.ServletRegistration.Dynamic addServlet(String servletName, javax.servlet.Servlet servlet) { return null; }
+            @Override
+            public javax.servlet.ServletRegistration.Dynamic addServlet(String servletName, Class<? extends javax.servlet.Servlet> servletClass) { return null; }
+            @Override
+            public java.util.Map<String, ? extends javax.servlet.ServletRegistration> getServletRegistrations() { return java.util.Collections.emptyMap(); }
         });
         List<String> configLocations = new java.util.ArrayList<>(java.util.Arrays.asList(
             "classpath:applicationContext-service.xml",
@@ -147,16 +156,6 @@ public class OpenApiSpecGenerator {
         Context.openSession();
         SessionFactory sessionFactory = (SessionFactory) ctx.getBean("sessionFactory");
         Connection conn = sessionFactory.getCurrentSession().doReturningWork(c -> c);
-        // Create shedlock table (not in Hibernate mappings, needed at runtime)
-        conn.prepareStatement(
-            "CREATE TABLE IF NOT EXISTS shedlock(" +
-            "name VARCHAR(64) NOT NULL, " +
-            "lock_until TIMESTAMP NOT NULL, " +
-            "locked_at TIMESTAMP NOT NULL, " +
-            "locked_by VARCHAR(255) NOT NULL, " +
-            "PRIMARY KEY (name))").execute();
-        conn.prepareStatement("ALTER TABLE person ALTER COLUMN creator SET NULL").execute();
-        conn.prepareStatement("ALTER TABLE concept ALTER COLUMN concept_id INT AUTO_INCREMENT").execute();
         loadDataSet(conn, "org/openmrs/include/initialInMemoryTestDataSet.xml");
         conn.commit();
         Context.authenticate("admin", "test");

@@ -12,9 +12,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.api.extension.ExtendWith;
 
-import java.net.URI;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Set;
 
@@ -78,12 +76,12 @@ class LocationSchemaIT {
         JsonNode schema = schemas.get("default");
         assertNotNull(schema, "No 'default' representation schema found in Location.json");
 
-        String requestBody = MAPPER.writeValueAsString(Map.of(
-                "name", "openapi-plugin-test-location",
-                "description", "Created by openapi-plugin IT tests"
-        ));
+        Map<String, String> payload = new LinkedHashMap<String, String>();
+        payload.put("name", "openapi-plugin-test-location");
+        payload.put("description", "Created by openapi-plugin IT tests");
+        String requestBody = MAPPER.writeValueAsString(payload);
 
-        HttpResponse<String> response = post(collectionUrl(), requestBody);
+        OpenMrsExtension.HttpResult response = post(collectionUrl(), requestBody);
         assertEquals(201, response.statusCode(),
                 "Expected 201 Created for new location: " + response.body());
 
@@ -121,11 +119,11 @@ class LocationSchemaIT {
         JsonNode schema = schemas.get("default");
         assertNotNull(schema, "No 'default' representation schema found in Location.json");
 
-        String requestBody = MAPPER.writeValueAsString(Map.of(
-                "description", "Updated by openapi-plugin IT tests"
-        ));
+        Map<String, String> payload = new LinkedHashMap<String, String>();
+        payload.put("description", "Updated by openapi-plugin IT tests");
+        String requestBody = MAPPER.writeValueAsString(payload);
 
-        HttpResponse<String> response = post(instanceUrl(locationUuid), requestBody);
+        OpenMrsExtension.HttpResult response = post(instanceUrl(locationUuid), requestBody);
         assertEquals(200, response.statusCode(),
                 "Expected 200 OK for location update: " + response.body());
 
@@ -145,7 +143,7 @@ class LocationSchemaIT {
         Assumptions.assumeTrue(locationUuid != null,
                 "Skipping: location was not created in the previous test");
 
-        HttpResponse<String> response = delete(instanceUrl(locationUuid));
+        OpenMrsExtension.HttpResult response = delete(instanceUrl(locationUuid));
         assertEquals(204, response.statusCode(),
                 "Expected 204 No Content when retiring location: " + response.body());
     }
@@ -164,36 +162,17 @@ class LocationSchemaIT {
     }
 
     private static JsonNode get(String url) throws Exception {
-        HttpResponse<String> response = OpenMrsExtension.HTTP.send(
-                HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .header("Authorization", OpenMrsExtension.AUTH_HEADER)
-                        .GET()
-                        .build(),
-                HttpResponse.BodyHandlers.ofString());
+        OpenMrsExtension.HttpResult response = OpenMrsExtension.get(url);
         assertEquals(200, response.statusCode(),
                 "Unexpected HTTP status for GET " + url + ": " + response.body());
         return MAPPER.readTree(response.body());
     }
 
-    private static HttpResponse<String> post(String url, String body) throws Exception {
-        return OpenMrsExtension.HTTP.send(
-                HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .header("Authorization", OpenMrsExtension.AUTH_HEADER)
-                        .header("Content-Type", "application/json")
-                        .POST(HttpRequest.BodyPublishers.ofString(body))
-                        .build(),
-                HttpResponse.BodyHandlers.ofString());
+    private static OpenMrsExtension.HttpResult post(String url, String body) throws Exception {
+        return OpenMrsExtension.post(url, body);
     }
 
-    private static HttpResponse<String> delete(String url) throws Exception {
-        return OpenMrsExtension.HTTP.send(
-                HttpRequest.newBuilder()
-                        .uri(URI.create(url))
-                        .header("Authorization", OpenMrsExtension.AUTH_HEADER)
-                        .DELETE()
-                        .build(),
-                HttpResponse.BodyHandlers.ofString());
+    private static OpenMrsExtension.HttpResult delete(String url) throws Exception {
+        return OpenMrsExtension.delete(url);
     }
 }

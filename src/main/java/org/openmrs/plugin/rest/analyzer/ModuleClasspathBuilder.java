@@ -45,7 +45,7 @@ public class ModuleClasspathBuilder {
             log.debug("Added module test classes: {}", testOutputDir);
         }
 
-        // Add target module's resolved test artifacts (transitive dependencies)
+        // Add target module's resolved test artifacts (transitive dependencies).
         int dependencyCount = 0;
         for (Object artifactObj : project.getTestArtifacts()) {
             Artifact artifact = (Artifact) artifactObj;

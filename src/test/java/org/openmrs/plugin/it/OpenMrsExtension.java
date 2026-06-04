@@ -4,9 +4,13 @@ import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.extension.BeforeAllCallback;
 import org.junit.jupiter.api.extension.ExtensionContext;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
 import java.io.UncheckedIOException;
-import java.net.http.HttpClient;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Paths;
 import java.util.Base64;
@@ -49,11 +53,68 @@ public class OpenMrsExtension implements BeforeAllCallback {
                     .encodeToString((USERNAME + ":" + PASSWORD).getBytes(StandardCharsets.UTF_8))
             : null;
 
-    public static final HttpClient HTTP = HttpClient.newHttpClient();
+    /** Simple HTTP response carrier (status code + body string). */
+    public static class HttpResult {
+        private final int status;
+        private final String body;
+
+        HttpResult(int status, String body) {
+            this.status = status;
+            this.body = body;
+        }
+
+        public int statusCode() { return status; }
+        public String body()    { return body; }
+    }
+
+    public static HttpResult get(String url) throws Exception {
+        return request("GET", url, null, null);
+    }
+
+    public static HttpResult post(String url, String jsonBody) throws Exception {
+        return request("POST", url, "application/json", jsonBody);
+    }
+
+    public static HttpResult delete(String url) throws Exception {
+        return request("DELETE", url, null, null);
+    }
+
+    private static HttpResult request(String method, String url, String contentType, String body) throws Exception {
+        HttpURLConnection conn = (HttpURLConnection) new URL(url).openConnection();
+        conn.setRequestMethod(method);
+        conn.setRequestProperty("Authorization", AUTH_HEADER);
+        if (contentType != null) {
+            conn.setRequestProperty("Content-Type", contentType);
+        }
+        if (body != null) {
+            conn.setDoOutput(true);
+            try (OutputStream os = conn.getOutputStream()) {
+                os.write(body.getBytes(StandardCharsets.UTF_8));
+            }
+        }
+        int status = conn.getResponseCode();
+        InputStream stream = status >= 400 ? conn.getErrorStream() : conn.getInputStream();
+        String responseBody = "";
+        if (stream != null) {
+            responseBody = readStream(stream);
+        }
+        conn.disconnect();
+        return new HttpResult(status, responseBody);
+    }
+
+    private static String readStream(InputStream is) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        byte[] tmp = new byte[4096];
+        int n;
+        while ((n = is.read(tmp)) != -1) {
+            buf.write(tmp, 0, n);
+        }
+        return buf.toString(StandardCharsets.UTF_8.name());
+    }
 
     private static String firstNonBlank(String... values) {
         for (String v : values) {
-            if (v != null && !v.isBlank()) return v;
+            if (v != null && !v.trim().isEmpty()) return v;
         }
         return null;
     }
