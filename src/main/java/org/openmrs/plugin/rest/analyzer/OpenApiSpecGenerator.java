@@ -78,6 +78,8 @@ public class OpenApiSpecGenerator {
 
     private static final Logger log = LoggerFactory.getLogger(OpenApiSpecGenerator.class);
 
+    private org.springframework.web.context.support.XmlWebApplicationContext ctx;
+
     public void setup(String moduleClassesDir) throws Exception {
         log.info("=== Setting up OpenAPI Spec Generator ===");
 
@@ -97,7 +99,7 @@ public class OpenApiSpecGenerator {
         // Step 3: Start Spring WebApplicationContext with mock servlet context.
         // Use file: URL for webModuleApplicationContext.xml to load only the target module's own copy,
         // avoiding double-loading when both omod-common and omod are on the classpath.
-        XmlWebApplicationContext ctx = new XmlWebApplicationContext();
+        ctx = new XmlWebApplicationContext();
         jakarta.servlet.FilterRegistration.Dynamic noopFilter = new jakarta.servlet.FilterRegistration.Dynamic() {
             public void addMappingForServletNames(java.util.EnumSet<jakarta.servlet.DispatcherType> d, boolean b, String... names) {}
             public java.util.Collection<String> getServletNameMappings() { return java.util.Collections.emptyList(); }
@@ -204,7 +206,7 @@ public class OpenApiSpecGenerator {
         Components components = new Components();
 
         // directory for individual schema files
-        Path schemaDir = Paths.get(outputDir, "generated-schemas");
+        Path schemaDir = Paths.get(outputDir, "resources");
         try {
             Files.createDirectories(schemaDir);
         } catch (Exception e) {
@@ -256,11 +258,26 @@ public class OpenApiSpecGenerator {
 
             // In main openapi.json components keep only $ref placeholders to the external file
             Schema<Object> refSchema = new Schema<>();
-            refSchema.$ref("./generated-schemas/" + resourceName + ".json#/schemas/" + resourceName);
+            refSchema.$ref("./resources/" + resourceName + ".json#/schemas/" + resourceName);
             components.addSchemas(resourceName, refSchema);
         }
 
         openAPI.components(components);
+
+        // Document concrete @Controller beans (all except MainResourceController / MainSubResourceController)
+        if (ctx != null) {
+            try {
+                Path controllersDir = Paths.get(outputDir, "controllers");
+                Files.createDirectories(controllersDir);
+                io.swagger.v3.oas.models.Paths controllerPaths =
+                    new ControllerDocumenter().document(ctx, controllersDir, components);
+                if (!controllerPaths.isEmpty()) {
+                    openAPI.paths(controllerPaths);
+                }
+            } catch (Exception e) {
+                log.warn("Failed to document controllers: {}", e.getMessage(), e);
+            }
+        }
 
         // write the final OpenAPI file with refs to generated schema files
         Path openApiOut = Paths.get(outputDir, outputFile);
@@ -282,7 +299,7 @@ public class OpenApiSpecGenerator {
     private static void addPathsForHandler(DelegatingResourceHandler<?> handler, String resourceName, io.swagger.v3.oas.models.Paths paths) {
         String restPath = CustomModelResolver.getResourceRestPath(handler);
         // $ref prefix pointing from openapi.json into the per-resource schema file
-        String schemaRef = "./generated-schemas/" + resourceName + ".json#/schemas/";
+        String schemaRef = "./resources/" + resourceName + ".json#/schemas/";
 
         // ---- Collection path (no UUID): GET list/search, POST create/upload ----
         PathItem collectionItem = new PathItem();

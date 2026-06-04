@@ -33,7 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Tests run in declared order; later tests are skipped if the create step failed.
  *
  * Run with:
- *   mvn verify -Dopenapi.schemas.dir=<path-to-generated-schemas>
+ *   mvn verify -Dopenapi.schemas.dir=<path-to-resources-dir>
  *
  * Skip with:
  *   mvn verify -DskipITs=true

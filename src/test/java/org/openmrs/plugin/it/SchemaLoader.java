@@ -43,7 +43,7 @@ public class SchemaLoader {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /**
-     * @param schemasDir  path to the generated-schemas directory
+     * @param schemasDir  path to the resources directory
      * @param fileName    e.g. "Patient.json"
      * @return map of representation name ("default", "full", ...) to its schema node
      */
@@ -139,10 +139,10 @@ public class SchemaLoader {
      * (case-insensitive). $refs inside path items are not resolved — we only need
      * the path strings and their HTTP operations.
      *
-     * Example: loadResourcePaths("/…/generated-schemas", "location") returns
+     * Example: loadResourcePaths("/…/resources", "location") returns
      *   { "/ws/rest/v1/location": PathItem, "/ws/rest/v1/location/{uuid}": PathItem }
      *
-     * @param schemasDir path to the generated-schemas directory
+     * @param schemasDir path to the resources directory
      * @param resourceName case-insensitive resource name to filter by (e.g. "location")
      */
     public static Map<String, PathItem> loadResourcePaths(String schemasDir, String resourceName)

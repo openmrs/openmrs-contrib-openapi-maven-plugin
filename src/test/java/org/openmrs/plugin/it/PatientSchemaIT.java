@@ -23,7 +23,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * Connection config is loaded by {@link OpenMrsExtension} from a .env file or env vars.
  *
  * Run with:
- *   mvn verify -Dopenapi.schemas.dir=<path-to-generated-schemas>
+ *   mvn verify -Dopenapi.schemas.dir=<path-to-resources-dir>
  *
  * Skip with:
  *   mvn verify -DskipITs=true
