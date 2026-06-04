@@ -60,6 +60,9 @@ public class ControllerDocumenter {
         "MainResourceController", "MainSubResourceController"
     ));
 
+    /** Schema names already registered as REST resource $ref placeholders. */
+    private Map<String, Schema<?>> resourceSchemas;
+
     /**
      * Discovers all @Controller beans, generates per-controller JSON files under controllersDir,
      * merges controller DTO schemas into mainComponents, and returns a Paths map for inclusion
@@ -69,6 +72,12 @@ public class ControllerDocumenter {
             throws IOException {
         Paths allPaths = new Paths();
         com.fasterxml.jackson.databind.ObjectMapper mapper = io.swagger.v3.core.util.Json.mapper();
+
+        // Capture the resource $ref placeholders so resolveType() can check them before
+        // falling through to Jackson bean introspection.
+        @SuppressWarnings("unchecked")
+        Map<String, Schema<?>> existingSchemas = (Map<String, Schema<?>>) (Map<?, ?>) mainComponents.getSchemas();
+        resourceSchemas = existingSchemas != null ? existingSchemas : new LinkedHashMap<String, Schema<?>>();
 
         List<Object> beans = new ArrayList<>(ctx.getBeansWithAnnotation(Controller.class).values());
         beans.sort((a, b) -> targetClass(a).getSimpleName().compareTo(targetClass(b).getSimpleName()));
@@ -81,8 +90,22 @@ public class ControllerDocumenter {
             if (basePath == null) continue;
 
             // Fresh converters per controller to avoid schema accumulation across controllers.
-            // Uses default ModelResolver (plain Java bean introspection via Jackson).
+            // The resource-ref converter runs first: any type already registered as a REST
+            // resource gets a $ref instead of full bean introspection, which prevents Jackson
+            // from ever recursing into their transitive dependencies.
             ModelConverters converters = new ModelConverters();
+            converters.addConverter(new io.swagger.v3.core.converter.ModelConverter() {
+                @Override
+                public Schema<?> resolve(AnnotatedType type,
+                        io.swagger.v3.core.converter.ModelConverterContext context,
+                        java.util.Iterator<io.swagger.v3.core.converter.ModelConverter> chain) {
+                    Class<?> raw = com.fasterxml.jackson.databind.type.TypeFactory.rawClass(type.getType());
+                    if (raw != null && resourceSchemas.containsKey(raw.getSimpleName())) {
+                        return new Schema<>().$ref("#/components/schemas/" + raw.getSimpleName());
+                    }
+                    return chain.hasNext() ? chain.next().resolve(type, context, chain) : null;
+                }
+            });
 
             Map<String, Schema<?>> controllerSchemas = new LinkedHashMap<>();
             Paths controllerPaths = new Paths();
@@ -94,10 +117,12 @@ public class ControllerDocumenter {
 
             if (controllerPaths.isEmpty()) continue;
 
-            // Merge controller schemas into the main openapi.json components so that
-            // $ref: "#/components/schemas/Foo" refs in the inline paths section resolve correctly.
+            // Merge controller DTO schemas into the main openapi.json components.
+            // Never overwrite existing resource $ref placeholders.
             for (Map.Entry<String, Schema<?>> e : controllerSchemas.entrySet()) {
-                mainComponents.addSchemas(e.getKey(), e.getValue());
+                if (!resourceSchemas.containsKey(e.getKey())) {
+                    mainComponents.addSchemas(e.getKey(), e.getValue());
+                }
             }
 
             controllerPaths.forEach(allPaths::addPathItem);
@@ -279,9 +304,16 @@ public class ControllerDocumenter {
             ResolvedSchema resolved = converters.resolveAsResolvedSchema(new AnnotatedType(type));
             if (resolved == null) return new ObjectSchema();
             if (resolved.referencedSchemas != null) {
-                @SuppressWarnings("unchecked")
-                Map<String, Schema<?>> refs = (Map<String, Schema<?>>) (Map<?, ?>) resolved.referencedSchemas;
-                schemas.putAll(refs);
+                for (Map.Entry<?, ?> e : resolved.referencedSchemas.entrySet()) {
+                    String name = (String) e.getKey();
+                    // Skip types that already have a REST resource $ref placeholder — their
+                    // schema lives in a resources/*.json file and refs to them will resolve there.
+                    if (!resourceSchemas.containsKey(name)) {
+                        @SuppressWarnings("unchecked")
+                        Schema<?> s = (Schema<?>) e.getValue();
+                        schemas.put(name, s);
+                    }
+                }
             }
             // resolved.schema is typically $ref: "#/components/schemas/TypeName"
             return resolved.schema != null ? resolved.schema : new ObjectSchema();
