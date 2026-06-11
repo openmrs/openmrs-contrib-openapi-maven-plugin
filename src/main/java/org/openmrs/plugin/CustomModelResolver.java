@@ -591,23 +591,30 @@ public class CustomModelResolver extends ModelResolver {
     PropertyGetter pg = getter.getAnnotation(PropertyGetter.class);
     if (pg == null) return null;
 
-    // arraySchema field takes precedence
-    io.swagger.v3.oas.annotations.media.Schema itemAnn = pg.arraySchema().schema();
-    if (itemAnn.anyOf().length > 0 || itemAnn.oneOf().length > 0
-        || itemAnn.implementation() != Void.class) {
-      Schema<?> itemSchema = buildSchemaFromAnnotation(itemAnn, propertyRep, context, chain);
-      if (itemSchema != null) {
-        ArraySchema arr = new ArraySchema();
-        arr.items(itemSchema);
-        return arr;
+    // arraySchema() and schema() were added to @PropertyGetter in REST module 3.1+.
+    // Older modules compile against a version that lacks these elements; calling them
+    // throws AbstractMethodError. Treat that as "no hint present".
+    try {
+      // arraySchema field takes precedence
+      io.swagger.v3.oas.annotations.media.Schema itemAnn = pg.arraySchema().schema();
+      if (itemAnn.anyOf().length > 0 || itemAnn.oneOf().length > 0
+          || itemAnn.implementation() != Void.class) {
+        Schema<?> itemSchema = buildSchemaFromAnnotation(itemAnn, propertyRep, context, chain);
+        if (itemSchema != null) {
+          ArraySchema arr = new ArraySchema();
+          arr.items(itemSchema);
+          return arr;
+        }
       }
-    }
 
-    // schema field
-    io.swagger.v3.oas.annotations.media.Schema schemaAnn = pg.schema();
-    if (schemaAnn.implementation() != Void.class
-        || schemaAnn.anyOf().length > 0 || schemaAnn.oneOf().length > 0) {
-      return buildSchemaFromAnnotation(schemaAnn, propertyRep, context, chain);
+      // schema field
+      io.swagger.v3.oas.annotations.media.Schema schemaAnn = pg.schema();
+      if (schemaAnn.implementation() != Void.class
+          || schemaAnn.anyOf().length > 0 || schemaAnn.oneOf().length > 0) {
+        return buildSchemaFromAnnotation(schemaAnn, propertyRep, context, chain);
+      }
+    } catch (NoSuchMethodError | AbstractMethodError ignored) {
+      // @PropertyGetter on this module's REST version has no schema()/arraySchema() elements
     }
 
     return null;

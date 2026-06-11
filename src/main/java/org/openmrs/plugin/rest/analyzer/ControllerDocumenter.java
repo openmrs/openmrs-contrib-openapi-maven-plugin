@@ -315,7 +315,14 @@ public class ControllerDocumenter {
                     }
                 }
             }
-            // resolved.schema is typically $ref: "#/components/schemas/TypeName"
+            // Jackson returns the inline object schema as resolved.schema, not a $ref.
+            // If the primary type ended up registered by name in referencedSchemas, emit a
+            // $ref so the requestBody/response points to the named component instead of inlining.
+            Class<?> rawType = com.fasterxml.jackson.databind.type.TypeFactory.rawClass(type);
+            if (rawType != null && resolved.referencedSchemas != null
+                    && resolved.referencedSchemas.containsKey(rawType.getSimpleName())) {
+                return new Schema<>().$ref("#/components/schemas/" + rawType.getSimpleName());
+            }
             return resolved.schema != null ? resolved.schema : new ObjectSchema();
         } catch (Exception e) {
             log.debug("Could not resolve schema for {}: {}", type, e.getMessage());

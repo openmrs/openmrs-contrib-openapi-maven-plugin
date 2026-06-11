@@ -19,9 +19,7 @@ import java.net.URL;
 import java.net.URLClassLoader;
 import java.nio.file.Files;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
-import java.util.Set;
 
 @Mojo(name = "analyze-representations",
       defaultPhase = LifecyclePhase.PROCESS_CLASSES,
@@ -69,7 +67,20 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
         log.info("==============================");
     }
 
-    private void prepareOutputDirectory() {
+    /**
+     * Returns true for JARs that belong in the generator classloader (plugin tool chain).
+     * Everything else — Spring, Hibernate, OpenMRS platform, Jackson — stays in the module
+     * classloader, ensuring only one version of each library is ever present.
+     */
+    private static boolean isGeneratorJar(String fileName) {
+        return fileName.startsWith("openmrs-openapi-maven-plugin-")
+                || fileName.startsWith("swagger-core-")
+                || fileName.startsWith("swagger-models-")
+                || fileName.startsWith("swagger-annotations-")
+                || fileName.startsWith("webservices.rest-omod-common-");
+    }
+
+private void prepareOutputDirectory() {
         File outputDir = new File(getOutputDirectory());
         if (!outputDir.exists()) {
             outputDir.mkdirs();
@@ -77,86 +88,128 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
     }
 
     /**
-     * Runs the spec generator in-process using a fully isolated URLClassLoader.
+     * Runs the spec generator in-process using two layered URLClassLoaders.
      *
-     * To avoid classloader conflicts (e.g. OpenMRS's Class.forName() calls using the
-     * plugin ClassRealm which lacks module-specific JARs like legacyui), we build one
-     * flat classpath that combines:
-     *   1. All JARs from the plugin's own ClassRealm (OpenMRS platform, Swagger, Spring, etc.)
-     *   2. The target module's compiled classes and test artifact JARs
+     * MODULE classloader — the target module's complete test classpath (its openmrs-core,
+     * Spring, Hibernate, Jackson, etc.). This is the "runtime truth" for the module: every
+     * platform class resolves to exactly the version the module was built against. HS 5
+     * ORM/engine JARs are stripped here — Hibernate Core detects their absence via ServiceLoader
+     * and silently skips the integration, which is harmless for schema generation.
      *
-     * This isolated URLClassLoader uses the JDK platform classloader as parent (not the
-     * Maven plugin ClassRealm), so all OpenMRS/Spring class loading happens within the
-     * isolated loader — mirroring what the forked JVM did, but in-process.
+     * GENERATOR classloader — only the plugin's tool-chain JARs (swagger-core, the plugin
+     * JAR itself, webservices.rest-omod-common). Its parent is the module classloader, so
+     * Spring/OpenMRS/Hibernate/Jackson all delegate upward to the module's versions. No
+     * version-matching heuristics needed; each library exists in exactly one place.
      *
-     * The generator is invoked via reflection to avoid class identity conflicts
-     * between the isolated loader and the plugin ClassRealm.
+     * OpenApiSpecGenerator is loaded from the generator classloader and invoked via
+     * reflection to avoid class identity conflicts with the plugin's own ClassRealm.
      */
     private void runGeneratorDirectly() throws MojoExecutionException {
-        // 1. Collect plugin ClassRealm URLs (OpenMRS platform, Swagger, Spring, etc.)
         URL[] pluginUrls = ((URLClassLoader) getClass().getClassLoader()).getURLs();
 
-        // 2. Collect target module classpath entries
         List<String> moduleClasspath = ModuleClasspathBuilder.buildTargetModuleClasspath(project);
-        URL[] moduleUrls = new URL[moduleClasspath.size()];
-        for (int i = 0; i < moduleClasspath.size(); i++) {
+
+        // Module classloader: module's test classpath.
+        // Strip the old servlet-api-*.jar (pre-Servlet-3.0 artifact ID) — it lacks Servlet 3+
+        // classes (FilterRegistration etc.) needed by WebComponentRegistrar at runtime. The
+        // Servlet 3+ API is injected below from the plugin's own javax.servlet-api JAR.
+        // NOTE: do NOT strip Hibernate Search JARs here. With a module-only classloader there is
+        // no mixed-version HS scenario; each module carries exactly one HS version, and stripping
+        // it breaks openmrs-api beans that reference FullTextSession / SearchSession directly.
+        List<URL> moduleUrls = new ArrayList<>();
+        boolean moduleHasServlet3 = false;
+        for (String path : moduleClasspath) {
+            String fileName = new File(path).getName();
+            if (fileName.matches("servlet-api-.*\\.jar")) {
+                log.debug("Skipping old servlet-api JAR from module classpath: {}", fileName);
+                continue;
+            }
+            if (fileName.startsWith("javax.servlet-api-")) {
+                moduleHasServlet3 = true;
+            }
             try {
-                moduleUrls[i] = new File(moduleClasspath.get(i)).toURI().toURL();
+                moduleUrls.add(new File(path).toURI().toURL());
             } catch (MalformedURLException e) {
-                throw new MojoExecutionException("Invalid classpath entry: " + moduleClasspath.get(i), e);
+                throw new MojoExecutionException("Invalid classpath entry: " + path, e);
             }
         }
 
-        // 3. Combine: plugin JARs first (their versions take precedence), then module deps.
-        // Deduplicate by filename to prevent the same JAR from being loaded twice
-        // (e.g. omod-common.jar appears in both plugin ClassRealm and module test artifacts).
-        // Also exclude the old javax.servlet:servlet-api (pre-Servlet-3.0 naming) from pluginUrls:
-        // openmrs-web transitively pulls it in, but the plugin supplies javax.servlet:javax.servlet-api
-        // which must win — having both on the classpath causes NoSuchMethodError for Servlet 3+ methods.
-        Set<String> pluginFileNames = new java.util.HashSet<>();
-        List<URL> allUrls = new ArrayList<>();
+        // omdCommonJarPath: the path to the omd-common JAR whose webModuleApplicationContext.xml
+        // will be loaded into Spring. MUST match the version of RestServiceImpl that gets loaded —
+        // i.e., the version in the MODULE's classpath. Newer versions may inject properties (like
+        // executorService) that didn't exist on the class in older versions, causing
+        // NotWritablePropertyException. Search the module classpath first; fall back to the plugin
+        // ClassRealm only if the module doesn't carry omd-common (unusual but possible).
+        String omdCommonJarPath = null;
+        for (String path : moduleClasspath) {
+            String fileName = new File(path).getName();
+            if (fileName.startsWith("webservices.rest-omod-common-") && !fileName.contains("-tests")) {
+                omdCommonJarPath = path;
+                log.debug("Found omd-common in module classpath: {}", fileName);
+                break;
+            }
+        }
+
+        // Generator classloader: only plugin tool-chain JARs.
+        // Also collect javax.servlet-api JAR (for injection into module CL when module lacks
+        // Servlet 3+), and fall back to the plugin's omd-common if the module doesn't carry it.
+        List<URL> generatorUrls = new ArrayList<>();
+        URL pluginServletApiUrl = null;
+        String pluginOmdCommonJarPath = null;
         for (URL url : pluginUrls) {
             String path = url.getPath();
             String fileName = path.substring(path.lastIndexOf('/') + 1);
-            if (fileName.matches("servlet-api-.*\\.jar")) {
-                log.debug("Skipping old servlet-api JAR from plugin ClassRealm: {}", fileName);
-                continue;
+            if (isGeneratorJar(fileName)) {
+                generatorUrls.add(url);
+                log.debug("Generator classpath: {}", fileName);
             }
-            pluginFileNames.add(fileName);
-            allUrls.add(url);
+            if (fileName.startsWith("javax.servlet-api-")) {
+                pluginServletApiUrl = url;
+            }
+            if (fileName.startsWith("webservices.rest-omod-common-") && !fileName.contains("-tests")) {
+                pluginOmdCommonJarPath = path;
+            }
         }
-        for (URL moduleUrl : moduleUrls) {
-            String path = moduleUrl.getPath();
-            String fileName = path.substring(path.lastIndexOf('/') + 1);
-            if (!pluginFileNames.contains(fileName)) {
-                allUrls.add(moduleUrl);
-            } else {
-                log.debug("Skipping duplicate module URL (already in plugin ClassRealm): {}", fileName);
-            }
+        if (omdCommonJarPath == null && pluginOmdCommonJarPath != null) {
+            omdCommonJarPath = pluginOmdCommonJarPath;
+            log.debug("omd-common not in module classpath; falling back to plugin version");
         }
 
-        log.debug("Isolated URLClassLoader: {} plugin URLs + {} module URLs",
-                pluginUrls.length, moduleUrls.length);
+        log.info("omdCommonJarPath: {}", omdCommonJarPath != null ? omdCommonJarPath : "(not found)");
+
+        // Inject Servlet 3+ API into module CL if the module doesn't already provide it.
+        if (!moduleHasServlet3 && pluginServletApiUrl != null) {
+            moduleUrls.add(pluginServletApiUrl);
+            log.debug("Injecting Servlet 3+ API into module classloader: {}",
+                    pluginServletApiUrl.getPath().substring(pluginServletApiUrl.getPath().lastIndexOf('/') + 1));
+        }
+
+        log.debug("Module classloader: {} entries (after HS 5 strip)", moduleUrls.size());
+        log.debug("Generator classloader: {} entries", generatorUrls.size());
 
         System.setProperty("useInMemoryDatabase", "true");
         System.setProperty("java.awt.headless", "true");
+        if (System.getProperty("OPENMRS_APPLICATION_DATA_DIRECTORY") == null) {
+            System.setProperty("OPENMRS_APPLICATION_DATA_DIRECTORY",
+                    System.getProperty("java.io.tmpdir"));
+        }
 
         ClassLoader originalClassLoader = Thread.currentThread().getContextClassLoader();
-        // Use the system classloader as parent so JDK platform modules (java.sql, etc.) are
-        // accessible. This is Java 8 compatible and in Java 9+ it chains through the platform
-        // classloader, which provides javax.sql, javax.xml, etc. without exposing Maven internals.
-        URLClassLoader isolatedClassLoader = new URLClassLoader(
-                allUrls.toArray(new URL[0]),
+        URLClassLoader moduleCL = new URLClassLoader(
+                moduleUrls.toArray(new URL[0]),
                 ClassLoader.getSystemClassLoader());
+        URLClassLoader generatorCL = new URLClassLoader(
+                generatorUrls.toArray(new URL[0]),
+                moduleCL);
 
         try {
-            Thread.currentThread().setContextClassLoader(isolatedClassLoader);
+            Thread.currentThread().setContextClassLoader(generatorCL);
 
-            // Load and invoke via reflection to avoid class identity conflicts
-            Class<?> generatorClass = isolatedClassLoader.loadClass(
+            Class<?> generatorClass = generatorCL.loadClass(
                     "org.openmrs.plugin.rest.analyzer.OpenApiSpecGenerator");
             Object generator = generatorClass.getDeclaredConstructor().newInstance();
-            generatorClass.getMethod("setup", String.class).invoke(generator, project.getBuild().getOutputDirectory());
+            generatorClass.getMethod("setup", String.class, String.class).invoke(generator,
+                    project.getBuild().getOutputDirectory(), omdCommonJarPath != null ? omdCommonJarPath : "");
             generatorClass.getMethod("generateOpenAPISpec", String.class, String.class).invoke(generator, getOutputDirectory(), getOutputFileName());
 
         } catch (InvocationTargetException e) {
@@ -166,11 +219,8 @@ public class RepresentationAnalyzerMojo extends AbstractMojo {
             throw new MojoExecutionException("Failed to generate OpenAPI specification", e);
         } finally {
             Thread.currentThread().setContextClassLoader(originalClassLoader);
-            try {
-                isolatedClassLoader.close();
-            } catch (IOException e) {
-                log.warn("Failed to close isolated URLClassLoader: {}", e.getMessage());
-            }
+            try { generatorCL.close(); } catch (IOException e) { log.warn("Failed to close generator CL: {}", e.getMessage()); }
+            try { moduleCL.close(); } catch (IOException e) { log.warn("Failed to close module CL: {}", e.getMessage()); }
         }
     }
 

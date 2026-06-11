@@ -80,7 +80,7 @@ public class OpenApiSpecGenerator {
 
     private org.springframework.web.context.support.XmlWebApplicationContext ctx;
 
-    public void setup(String moduleClassesDir) throws Exception {
+    public void setup(String moduleClassesDir, String omdCommonJarPath) throws Exception {
         log.info("=== Setting up OpenAPI Spec Generator ===");
 
         final String h2Url = "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000;IGNORECASE=TRUE";
@@ -142,6 +142,18 @@ public class OpenApiSpecGenerator {
             "classpath*:moduleApplicationContext.xml",
             "classpath*:openmrs-servlet.xml"
         ));
+        // Always load webModuleApplicationContext.xml from webservices.rest-omd-common — it
+        // defines restService, restHelperService, and the component scan for REST controllers.
+        // Using an explicit jar: URL avoids classpath scan ambiguity across two classloaders.
+        // Spring 5's allowBeanDefinitionOverriding defaults to true, so if the target module
+        // also provides webModuleApplicationContext.xml the last definition wins harmlessly.
+        if (omdCommonJarPath != null && !omdCommonJarPath.isEmpty()) {
+            String omdCommonCtxUrl = "jar:file:" + omdCommonJarPath + "!/webModuleApplicationContext.xml";
+            configLocations.add(omdCommonCtxUrl);
+            log.info("Loading REST beans from omd-common: {}", omdCommonCtxUrl);
+        } else {
+            log.warn("omdCommonJarPath is empty — restService bean may not be available");
+        }
         if (moduleClassesDir != null && !moduleClassesDir.isEmpty()) {
             java.io.File webModuleCtxFile = new java.io.File(moduleClassesDir, "webModuleApplicationContext.xml");
             if (webModuleCtxFile.exists()) {
