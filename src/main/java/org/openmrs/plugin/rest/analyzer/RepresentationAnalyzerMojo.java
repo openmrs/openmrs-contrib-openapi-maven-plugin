@@ -104,10 +104,51 @@ private void prepareOutputDirectory() {
      * OpenApiSpecGenerator is loaded from the generator classloader and invoked via
      * reflection to avoid class identity conflicts with the plugin's own ClassRealm.
      */
+    /** Minimum openmrs-core version known to work. Earlier versions have initialization bugs. */
+    private static final String MIN_CORE_VERSION = "2.6.0";
+
+    /**
+     * Scans the module classpath for openmrs-api-*.jar, extracts the version, and warns if it is
+     * below {@link #MIN_CORE_VERSION}. Does not throw — lets generation proceed so the user sees
+     * the actual error in context.
+     */
+    private void warnIfCoreVersionTooOld(List<String> moduleClasspath) {
+        String detected = null;
+        for (String path : moduleClasspath) {
+            String fileName = new File(path).getName();
+            if (fileName.startsWith("openmrs-api-") && fileName.endsWith(".jar")
+                    && !fileName.contains("-tests") && !fileName.contains("-sources") && !fileName.contains("-javadoc")) {
+                detected = fileName.substring("openmrs-api-".length(), fileName.length() - ".jar".length());
+                break;
+            }
+        }
+        if (detected == null) {
+            log.warn("Could not detect openmrs-core version from module classpath. Minimum supported version is {}.", MIN_CORE_VERSION);
+            return;
+        }
+        org.apache.maven.artifact.versioning.DefaultArtifactVersion detectedV =
+                new org.apache.maven.artifact.versioning.DefaultArtifactVersion(detected);
+        org.apache.maven.artifact.versioning.DefaultArtifactVersion minimumV =
+                new org.apache.maven.artifact.versioning.DefaultArtifactVersion(MIN_CORE_VERSION);
+        if (detectedV.compareTo(minimumV) < 0) {
+            log.warn("==========================================================");
+            log.warn("openmrs-core {} detected; minimum supported version is {}.", detected, MIN_CORE_VERSION);
+            log.warn("Known failures on older versions:");
+            log.warn("  < 2.4.4  NoSuchMethodError: OpenmrsUtil.getApplicationDataDirectoryAsFile()");
+            log.warn("  < 2.6.0  NullPointerException in OpenmrsConfigurationFactory.getConfiguration()");
+            log.warn("Generation will be attempted but may fail. Upgrade openmrs-core to {} or later.", MIN_CORE_VERSION);
+            log.warn("==========================================================");
+        } else {
+            log.debug("openmrs-core {} — supported (minimum {}).", detected, MIN_CORE_VERSION);
+        }
+    }
+
     private void runGeneratorDirectly() throws MojoExecutionException {
         URL[] pluginUrls = ((URLClassLoader) getClass().getClassLoader()).getURLs();
 
         List<String> moduleClasspath = ModuleClasspathBuilder.buildTargetModuleClasspath(project);
+
+        warnIfCoreVersionTooOld(moduleClasspath);
 
         // Module classloader: module's test classpath.
         // Strip the old servlet-api-*.jar (pre-Servlet-3.0 artifact ID) — it lacks Servlet 3+

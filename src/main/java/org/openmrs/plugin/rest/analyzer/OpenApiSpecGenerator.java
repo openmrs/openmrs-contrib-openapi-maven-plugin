@@ -79,8 +79,10 @@ public class OpenApiSpecGenerator {
     private static final Logger log = LoggerFactory.getLogger(OpenApiSpecGenerator.class);
 
     private org.springframework.web.context.support.XmlWebApplicationContext ctx;
+    private String moduleClassesDir;
 
     public void setup(String moduleClassesDir, String omdCommonJarPath) throws Exception {
+        this.moduleClassesDir = moduleClassesDir;
         log.info("=== Setting up OpenAPI Spec Generator ===");
 
         final String h2Url = "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000;IGNORECASE=TRUE";
@@ -228,8 +230,18 @@ public class OpenApiSpecGenerator {
 
         for (DelegatingResourceHandler<?> handler : handlers) {
             String resourceName = CustomModelResolver.getResourceName(handler);
-            log.info("generating " + resourceName);
+
+            // Always resolve schemas — the ModelConverterContext needs every handler processed so
+            // that cross-module $ref targets (e.g. Patient, Visit) can be named correctly.
             ResolvedSchema resolvedSchema = converters.resolveAsResolvedSchema(new OpenmrsResourceAnnotatedType(handler.getClass(), handler));
+
+            // Only write files and openapi.json entries for resources defined in this module.
+            // Handlers from dependency JARs (REST core, openmrs-api, etc.) are skipped.
+            if (!isModuleOwnedHandler(handler)) {
+                continue;
+            }
+
+            log.info("generating " + resourceName);
 
             // Collect schemas for this resource
             Components resourceComponents = new Components();
@@ -281,7 +293,7 @@ public class OpenApiSpecGenerator {
                 Path controllersDir = Paths.get(outputDir, "controllers");
                 Files.createDirectories(controllersDir);
                 io.swagger.v3.oas.models.Paths controllerPaths =
-                    new ControllerDocumenter().document(ctx, controllersDir, components);
+                    new ControllerDocumenter().document(ctx, controllersDir, components, moduleClassesDir);
                 if (!controllerPaths.isEmpty()) {
                     openAPI.paths(controllerPaths);
                 }
@@ -436,6 +448,29 @@ public class OpenApiSpecGenerator {
         config.setProperty(DatabaseConfig.PROPERTY_DATATYPE_FACTORY, new H2DataTypeFactory());
         IDataSet dataset = new FlatXmlDataSetBuilder().setColumnSensing(true).build(is);
         DatabaseOperation.REFRESH.execute(dbConn, dataset);
+    }
+
+    /**
+     * Returns true if the handler's class was loaded from this module's own compiled output
+     * (target/classes), false if it came from a dependency JAR.
+     * Falls back to true when moduleClassesDir is not set (generates everything).
+     */
+    private boolean isModuleOwnedHandler(DelegatingResourceHandler<?> handler) {
+        if (moduleClassesDir == null || moduleClassesDir.isEmpty()) {
+            return true;
+        }
+        try {
+            java.security.CodeSource cs = handler.getClass().getProtectionDomain().getCodeSource();
+            if (cs == null || cs.getLocation() == null) {
+                return false;
+            }
+            java.io.File handlerLocation = new java.io.File(cs.getLocation().toURI()).getCanonicalFile();
+            java.io.File classesDir = new java.io.File(moduleClassesDir).getCanonicalFile();
+            return handlerLocation.equals(classesDir);
+        } catch (Exception e) {
+            log.warn("Could not determine code source for {}: {}", handler.getClass().getName(), e.getMessage());
+            return false;
+        }
     }
 
     private String detectOpenmrsVersion() {

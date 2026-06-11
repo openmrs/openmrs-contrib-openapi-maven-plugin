@@ -68,8 +68,8 @@ public class ControllerDocumenter {
      * merges controller DTO schemas into mainComponents, and returns a Paths map for inclusion
      * in the main openapi.json.
      */
-    public Paths document(ApplicationContext ctx, Path controllersDir, Components mainComponents)
-            throws IOException {
+    public Paths document(ApplicationContext ctx, Path controllersDir, Components mainComponents,
+            String moduleClassesDir) throws IOException {
         Paths allPaths = new Paths();
         com.fasterxml.jackson.databind.ObjectMapper mapper = io.swagger.v3.core.util.Json.mapper();
 
@@ -82,9 +82,13 @@ public class ControllerDocumenter {
         List<Object> beans = new ArrayList<>(ctx.getBeansWithAnnotation(Controller.class).values());
         beans.sort((a, b) -> targetClass(a).getSimpleName().compareTo(targetClass(b).getSimpleName()));
 
+        java.io.File classesDir = (moduleClassesDir != null && !moduleClassesDir.isEmpty())
+                ? new java.io.File(moduleClassesDir) : null;
+
         for (Object bean : beans) {
             Class<?> cls = targetClass(bean);
             if (EXCLUDED_CONTROLLERS.contains(cls.getSimpleName())) continue;
+            if (classesDir != null && !isModuleOwned(cls, classesDir)) continue;
 
             String basePath = classBasePath(cls);
             if (basePath == null) continue;
@@ -142,7 +146,7 @@ public class ControllerDocumenter {
 
             Path outFile = controllersDir.resolve(cls.getSimpleName() + ".json");
             Files.write(outFile, mapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(root));
-            log.info("Wrote controller file: {}", outFile);
+            System.out.println("Wrote controller file: " + outFile.toAbsolutePath());
         }
 
         return allPaths;
@@ -192,7 +196,7 @@ public class ControllerDocumenter {
 
         if (httpMethods.isEmpty()) return;
 
-        String fullPath = joinPath(basePath, subPath);
+        String fullPath = normalizeRestPath(joinPath(basePath, subPath));
         Operation op = buildOperation(method, schemas, converters);
 
         PathItem pathItem = paths.get(fullPath);
@@ -343,9 +347,31 @@ public class ControllerDocumenter {
 
     private static String classBasePath(Class<?> cls) {
         RequestMapping rm = cls.getAnnotation(RequestMapping.class);
-        if (rm == null) return null;
+        if (rm == null) return "";  // no class-level mapping; method annotations carry the full path
         String[] vals = rm.value().length > 0 ? rm.value() : rm.path();
-        return vals.length > 0 ? vals[0] : null;
+        return vals.length > 0 ? vals[0] : "";
+    }
+
+    private static boolean isModuleOwned(Class<?> cls, java.io.File classesDir) {
+        try {
+            java.security.CodeSource cs = cls.getProtectionDomain().getCodeSource();
+            if (cs == null || cs.getLocation() == null) return false;
+            return new java.io.File(cs.getLocation().toURI()).getCanonicalFile()
+                    .equals(classesDir.getCanonicalFile());
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    // Strips the /rest/**/ wildcard prefix used by OpenMRS REST controllers.
+    // "**" is not a valid OpenAPI path template segment, so it must be removed.
+    private static String normalizeRestPath(String path) {
+        // e.g. "/rest/**/emrapi/foo" -> "/emrapi/foo"
+        int wildcardIdx = path.indexOf("**/");
+        if (wildcardIdx >= 0) {
+            return "/" + path.substring(wildcardIdx + 3);
+        }
+        return path;
     }
 
     private static String joinPath(String base, String sub) {
