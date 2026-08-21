@@ -69,7 +69,7 @@ public class ControllerDocumenter {
      * in the main openapi.json.
      */
     public Paths document(ApplicationContext ctx, Path controllersDir, Components mainComponents,
-            String moduleClassesDir) throws IOException {
+            String ownedLocationsSemicolon) throws IOException {
         Paths allPaths = new Paths();
         com.fasterxml.jackson.databind.ObjectMapper mapper = io.swagger.v3.core.util.Json.mapper();
 
@@ -79,16 +79,17 @@ public class ControllerDocumenter {
         Map<String, Schema<?>> existingSchemas = (Map<String, Schema<?>>) (Map<?, ?>) mainComponents.getSchemas();
         resourceSchemas = existingSchemas != null ? existingSchemas : new LinkedHashMap<String, Schema<?>>();
 
+        java.util.Set<String> ownedLocations = (ownedLocationsSemicolon != null && !ownedLocationsSemicolon.isEmpty())
+                ? new java.util.HashSet<String>(java.util.Arrays.asList(ownedLocationsSemicolon.split(";")))
+                : null;
+
         List<Object> beans = new ArrayList<>(ctx.getBeansWithAnnotation(Controller.class).values());
         beans.sort((a, b) -> targetClass(a).getSimpleName().compareTo(targetClass(b).getSimpleName()));
-
-        java.io.File classesDir = (moduleClassesDir != null && !moduleClassesDir.isEmpty())
-                ? new java.io.File(moduleClassesDir) : null;
 
         for (Object bean : beans) {
             Class<?> cls = targetClass(bean);
             if (EXCLUDED_CONTROLLERS.contains(cls.getSimpleName())) continue;
-            if (classesDir != null && !isModuleOwned(cls, classesDir)) continue;
+            if (ownedLocations != null && !isModuleOwned(cls, ownedLocations)) continue;
 
             String basePath = classBasePath(cls);
             if (basePath == null) continue;
@@ -218,7 +219,7 @@ public class ControllerDocumenter {
 
     private Operation buildOperation(Method method, Map<String, Schema<?>> schemas,
             ModelConverters converters) {
-        Operation op = new Operation();
+        Operation op = new Operation().addTagsItem("Controllers");
         List<Parameter> params = new ArrayList<>();
         RequestBody requestBody = null;
 
@@ -352,26 +353,32 @@ public class ControllerDocumenter {
         return vals.length > 0 ? vals[0] : "";
     }
 
-    private static boolean isModuleOwned(Class<?> cls, java.io.File classesDir) {
+    private static boolean isModuleOwned(Class<?> cls, java.util.Set<String> ownedLocations) {
         try {
             java.security.CodeSource cs = cls.getProtectionDomain().getCodeSource();
             if (cs == null || cs.getLocation() == null) return false;
-            return new java.io.File(cs.getLocation().toURI()).getCanonicalFile()
-                    .equals(classesDir.getCanonicalFile());
+            java.io.File classLocation = new java.io.File(cs.getLocation().toURI()).getCanonicalFile();
+            for (String owned : ownedLocations) {
+                if (classLocation.equals(new java.io.File(owned).getCanonicalFile())) {
+                    return true;
+                }
+            }
+            return false;
         } catch (Exception e) {
             return false;
         }
     }
 
-    // Strips the /rest/**/ wildcard prefix used by OpenMRS REST controllers.
-    // "**" is not a valid OpenAPI path template segment, so it must be removed.
+    // Strips the /rest/**/ wildcard prefix used by OpenMRS REST controllers, then
+    // prepends /ws so the final path matches the actual servlet mount point.
+    // e.g. "/rest/**/emrapi/foo" -> "/ws/emrapi/foo"
+    //      "/rest/v1/visitconfiguration" -> "/ws/rest/v1/visitconfiguration"
     private static String normalizeRestPath(String path) {
-        // e.g. "/rest/**/emrapi/foo" -> "/emrapi/foo"
         int wildcardIdx = path.indexOf("**/");
         if (wildcardIdx >= 0) {
-            return "/" + path.substring(wildcardIdx + 3);
+            return "/ws/" + path.substring(wildcardIdx + 3);
         }
-        return path;
+        return "/ws" + path;
     }
 
     private static String joinPath(String base, String sub) {

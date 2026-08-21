@@ -14,8 +14,15 @@ import java.util.Map;
 
 import org.apache.commons.beanutils.PropertyUtils;
 import org.apache.commons.lang3.StringUtils;
+import org.openmrs.Attributable;
+import org.openmrs.Auditable;
+import org.openmrs.Changeable;
 import org.openmrs.ConceptDatatype;
+import org.openmrs.FormRecordable;
 import org.openmrs.OpenmrsObject;
+import org.openmrs.Retireable;
+import org.openmrs.Voidable;
+import org.openmrs.customdatatype.Customizable;
 import org.openmrs.module.webservices.rest.SimpleObject;
 import org.openmrs.module.webservices.rest.util.ReflectionUtil;
 import org.openmrs.module.webservices.rest.web.annotation.PropertyGetter;
@@ -54,9 +61,13 @@ public class CustomModelResolver extends ModelResolver {
 
   public static final Representation[] STANDARD_REPRESENTATIONS = {Representation.DEFAULT, Representation.FULL, Representation.REF};
 
-  private static final List<Class<?>> ABILITY_INTERFACES = java.util.Arrays.asList(
+  private static final List<Class<?>> RESOURCE_ABILITY_INTERFACES = java.util.Arrays.asList(
       Retrievable.class, Creatable.class, Updatable.class, Deletable.class,
       Searchable.class, Listable.class, Purgeable.class, Uploadable.class, SubResource.class
+  );
+  private static final List<Class<?>> DELEGATE_ABILITY_INTERFACES = java.util.Arrays.asList(
+      FormRecordable.class, Retireable.class, Voidable.class, Changeable.class, Auditable.class,
+      Customizable.class, org.openmrs.Creatable.class, Attributable.class
   );
 
   public CustomModelResolver(ObjectMapper mapper) {
@@ -84,12 +95,23 @@ public class CustomModelResolver extends ModelResolver {
         combinedSchema.setDescription("One of the supported representations for " + resourceName);
 
         List<String> abilities = new ArrayList<>();
-        for (Class<?> ability : ABILITY_INTERFACES) {
+        for (Class<?> ability : RESOURCE_ABILITY_INTERFACES) {
           if (ability.isAssignableFrom(handler.getClass())) {
             abilities.add(ability.getSimpleName());
           }
         }
-        combinedSchema.addExtension("x-openmrs-abilities", abilities);
+        combinedSchema.addExtension("x-openmrs-resource-abilities", abilities);
+
+        Class<?> handlerDelegateType = getDelegateType(handler);
+        if (handlerDelegateType != null) {
+          List<String> delegateAbilities = new ArrayList<>();
+          for (Class<?> ability : DELEGATE_ABILITY_INTERFACES) {
+            if (ability.isAssignableFrom(handlerDelegateType)) {
+              delegateAbilities.add(ability.getSimpleName());
+            }
+          }
+          combinedSchema.addExtension("x-openmrs-delegate-abilities", delegateAbilities);
+        }
 
         // Build intermediary ResourceGet schema as anyOf of all ResourceGet_* schemas
         if (!getSchemas.isEmpty()) {
@@ -121,8 +143,21 @@ public class CustomModelResolver extends ModelResolver {
       // SimpleObject is a LinkedHashMap<String, Object>. The default Jackson resolver
       // maps Object values to {"type": "object"} in additionalProperties, but SimpleObject
       // values can be any JSON type (strings, dates, booleans, nested objects, etc.).
+      //
+      // When used with a concrete type argument (e.g. SimpleObject<AuditInfo>), that argument
+      // documents the actual shape of the map's contents (see SimpleObject's class-level javadoc
+      // in the REST module) - resolve it like any other type instead of falling back to a generic
+      // object schema. Raw usage and wildcard usage (SimpleObject<?>, the vast majority of the
+      // codebase) still fall through to the generic schema below, since there's no real type to
+      // resolve.
       if (type.getType() != null
               && SimpleObject.class.isAssignableFrom(TypeFactory.rawClass(type.getType()))) {
+        if (type.getType() instanceof ParameterizedType) {
+          Type typeArg = ((ParameterizedType) type.getType()).getActualTypeArguments()[0];
+          if (typeArg instanceof Class && typeArg != Object.class) {
+            return resolve(new AnnotatedType(typeArg), context, chain);
+          }
+        }
         ObjectSchema schema = new ObjectSchema();
         schema.additionalProperties(Boolean.TRUE);
         return schema;
@@ -491,7 +526,7 @@ public class CustomModelResolver extends ModelResolver {
 
     // @PropertyGetter annotations on the resource handler hierarchy.
     // These override delegate properties at runtime (checked first in getProperty()).
-    // Walk most-derived → base using putIfAbsent so the most-derived handler's getter wins.
+    // Walk most-derived -> base using putIfAbsent so the most-derived handler's getter wins.
     Class<?> handlerClass = handler.getClass();
     while (handlerClass != null && !handlerClass.equals(Object.class)) {
       for (Method m : handlerClass.getDeclaredMethods()) {
@@ -552,7 +587,7 @@ public class CustomModelResolver extends ModelResolver {
         } else if (java.util.Map.class.isAssignableFrom(TypeFactory.rawClass(propType))) {
           // Map types (e.g. Map<String, PersonAttribute>) must NOT go through super.resolve():
           // Jackson would recursively resolve the value type as a full POJO, which cascades
-          // inline schema registration for PersonAttribute → Person → Concept → ...
+          // inline schema registration for PersonAttribute -> Person -> Concept -> ...
           ObjectSchema mapSchema = new ObjectSchema();
           com.fasterxml.jackson.databind.JavaType valueJavaType =
               TypeFactory.defaultInstance().constructType(propType).getContentType();
@@ -727,7 +762,8 @@ public class CustomModelResolver extends ModelResolver {
 
   /**
    * Returns the REST path for a resource handler by reading the name() field of its
-   * {@code @Resource} annotation (e.g. "v1/visit" → "/ws/rest/v1/visit").
+   * {@code @Resource} annotation (e.g. "v1/visit" -> "/ws/rest/v1/visit").
+   * All paths use the /ws servlet prefix to match the actual OpenMRS mount point.
    * Falls back to lowercasing the resource name if no annotation is found.
    */
   public static String getResourceRestPath(DelegatingResourceHandler<?> handler) {

@@ -80,9 +80,15 @@ public class OpenApiSpecGenerator {
 
     private org.springframework.web.context.support.XmlWebApplicationContext ctx;
     private String moduleClassesDir;
+    private java.util.Set<String> ownedLocations;
+    private String moduleName;
 
-    public void setup(String moduleClassesDir, String omdCommonJarPath) throws Exception {
+    public void setup(String ownedLocationsSemicolon, String omodCommonJarPath, String moduleName, String moduleClassesDir) throws Exception {
         this.moduleClassesDir = moduleClassesDir;
+        this.moduleName = moduleName;
+        this.ownedLocations = new java.util.HashSet<String>(
+                java.util.Arrays.asList(ownedLocationsSemicolon.split(";")));
+        log.info("Owned locations: {}", this.ownedLocations);
         log.info("=== Setting up OpenAPI Spec Generator ===");
 
         final String h2Url = "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000;IGNORECASE=TRUE";
@@ -144,17 +150,17 @@ public class OpenApiSpecGenerator {
             "classpath*:moduleApplicationContext.xml",
             "classpath*:openmrs-servlet.xml"
         ));
-        // Always load webModuleApplicationContext.xml from webservices.rest-omd-common — it
+        // Always load webModuleApplicationContext.xml from webservices.rest-omod-common — it
         // defines restService, restHelperService, and the component scan for REST controllers.
         // Using an explicit jar: URL avoids classpath scan ambiguity across two classloaders.
         // Spring 5's allowBeanDefinitionOverriding defaults to true, so if the target module
         // also provides webModuleApplicationContext.xml the last definition wins harmlessly.
-        if (omdCommonJarPath != null && !omdCommonJarPath.isEmpty()) {
-            String omdCommonCtxUrl = "jar:file:" + omdCommonJarPath + "!/webModuleApplicationContext.xml";
-            configLocations.add(omdCommonCtxUrl);
-            log.info("Loading REST beans from omd-common: {}", omdCommonCtxUrl);
+        if (omodCommonJarPath != null && !omodCommonJarPath.isEmpty()) {
+            String omodCommonCtxUrl = "jar:file:" + omodCommonJarPath + "!/webModuleApplicationContext.xml";
+            configLocations.add(omodCommonCtxUrl);
+            log.info("Loading REST beans from omod-common: {}", omodCommonCtxUrl);
         } else {
-            log.warn("omdCommonJarPath is empty — restService bean may not be available");
+            log.warn("omodCommonJarPath is empty — restService bean may not be available");
         }
         if (moduleClassesDir != null && !moduleClassesDir.isEmpty()) {
             java.io.File webModuleCtxFile = new java.io.File(moduleClassesDir, "webModuleApplicationContext.xml");
@@ -177,24 +183,6 @@ public class OpenApiSpecGenerator {
         Context.getAdministrationService().saveGlobalProperty(
             new GlobalProperty(RestConstants.SWAGGER_QUIET_DOCS_GLOBAL_PROPERTY_NAME, "true"));
         Context.flushSession();
-    }
-
-    public void getResourceMetadata() {
-        System.out.println("Starting restService...");
-        RestService restService = Context.getService(RestService.class);
-        restService.initialize();
-        List<DelegatingResourceHandler<?>> handlers = restService.getResourceHandlers();
-        Collections.sort(handlers, Comparator.comparing(h -> h.getClass().getSimpleName()));
-        System.out.println("Starting restService... done");
-
-        for (DelegatingResourceHandler<?> handler : handlers) {
-            List<Class<?>> allResourceAbilities = Arrays.asList(Retrievable.class, Searchable.class, Listable.class, Creatable.class, Updatable.class, Uploadable.class, Deletable.class, Purgeable.class);
-            List<Class<?>> allDelegateAbilities = Arrays.asList(FormRecordable.class, Retireable.class, Voidable.class, Changeable.class, Auditable.class, Customizable.class, org.openmrs.Creatable.class, Attributable.class);
-            String resourceName = CustomModelResolver.getResourceName(handler);
-            List<String> resourceAbilities = allResourceAbilities.stream().filter(ability -> ability.isAssignableFrom(handler.getClass())).map(Class::getSimpleName).collect(Collectors.toList());
-
-            System.out.println(resourceName + ":: " + resourceAbilities);
-        }
     }
 
     public void generateOpenAPISpec(String outputDir, String outputFile) {
@@ -279,10 +267,24 @@ public class OpenApiSpecGenerator {
             }
             System.out.println("Wrote schema file: " + outFile.toAbsolutePath());
 
-            // In main openapi.json components keep only $ref placeholders to the external file
-            Schema<Object> refSchema = new Schema<>();
-            refSchema.$ref("./resources/" + resourceName + ".json#/schemas/" + resourceName);
-            components.addSchemas(resourceName, refSchema);
+            // Add all schemas for this resource directly into components/schemas so that
+            // Swagger UI can resolve named $refs (QueueGet, QueueCreate, etc.) without
+            // needing to follow external file refs.
+            components.addSchemas(resourceName, resolvedSchema.schema);
+            if (resolvedSchema.referencedSchemas != null) {
+                resolvedSchema.referencedSchemas.entrySet().stream()
+                    .filter(e -> e.getKey().startsWith(resourceName))
+                    .forEach(e -> components.addSchemas(e.getKey(), e.getValue()));
+            }
+
+            // Add resource paths to the main openapi.json so they appear in Swagger UI.
+            // (Controller paths are added separately via ControllerDocumenter below.)
+            if (!resourcePaths.isEmpty()) {
+                if (openAPI.getPaths() == null) {
+                    openAPI.paths(new io.swagger.v3.oas.models.Paths());
+                }
+                openAPI.getPaths().putAll(resourcePaths);
+            }
         }
 
         openAPI.components(components);
@@ -293,20 +295,38 @@ public class OpenApiSpecGenerator {
                 Path controllersDir = Paths.get(outputDir, "controllers");
                 Files.createDirectories(controllersDir);
                 io.swagger.v3.oas.models.Paths controllerPaths =
-                    new ControllerDocumenter().document(ctx, controllersDir, components, moduleClassesDir);
+                    new ControllerDocumenter().document(ctx, controllersDir, components,
+                        ownedLocations != null ? String.join(";", ownedLocations) : "");
                 if (!controllerPaths.isEmpty()) {
-                    openAPI.paths(controllerPaths);
+                    if (openAPI.getPaths() == null) {
+                        openAPI.paths(controllerPaths);
+                    } else {
+                        openAPI.getPaths().putAll(controllerPaths);
+                    }
                 }
             } catch (Exception e) {
                 log.warn("Failed to document controllers: {}", e.getMessage(), e);
             }
         }
 
-        // write the final OpenAPI file with refs to generated schema files
+        openAPI.addTagsItem(new io.swagger.v3.oas.models.tags.Tag().name("Resources"));
+        openAPI.addTagsItem(new io.swagger.v3.oas.models.tags.Tag().name("Controllers"));
+
+        // write the final OpenAPI file
         Path openApiOut = Paths.get(outputDir, outputFile);
         try {
             Files.createDirectories(openApiOut.getParent());
             String json = io.swagger.v3.core.util.Json.pretty(openAPI);
+            // Rewrite all file-relative refs to standard component refs so that
+            // openapi.json is self-describing with uniform "#/components/schemas/" pointers.
+            //
+            // Two forms to fix:
+            //   "#/schemas/Foo"           (intra-file refs from CustomModelResolver)
+            //   "./Location.json#/schemas/Foo"  (cross-module refs from CustomModelResolver)
+            // Both become "#/components/schemas/Foo".
+            json = json.replace("\"#/schemas/", "\"#/components/schemas/");
+            json = json.replaceAll("\"\\./" + "[A-Za-z0-9_.\\-]+" + "\\.json#/schemas/",
+                "\"#/components/schemas/");
             Files.write(openApiOut, json.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             System.out.println("Wrote OpenAPI file: " + openApiOut.toAbsolutePath());
         } catch (Exception e) {
@@ -321,8 +341,7 @@ public class OpenApiSpecGenerator {
      */
     private static void addPathsForHandler(DelegatingResourceHandler<?> handler, String resourceName, io.swagger.v3.oas.models.Paths paths) {
         String restPath = CustomModelResolver.getResourceRestPath(handler);
-        // $ref prefix pointing from openapi.json into the per-resource schema file
-        String schemaRef = "./resources/" + resourceName + ".json#/schemas/";
+        String schemaRef = "#/components/schemas/";
 
         // ---- Collection path (no UUID): GET list/search, POST create/upload ----
         PathItem collectionItem = new PathItem();
@@ -370,6 +389,7 @@ public class OpenApiSpecGenerator {
         }
 
         if (collectionItem.readOperationsMap() != null && !collectionItem.readOperationsMap().isEmpty()) {
+            tagPathItem(collectionItem, "Resources");
             paths.addPathItem(restPath, collectionItem);
         }
 
@@ -423,7 +443,14 @@ public class OpenApiSpecGenerator {
         }
 
         if (instanceItem.readOperationsMap() != null && !instanceItem.readOperationsMap().isEmpty()) {
+            tagPathItem(instanceItem, "Resources");
             paths.addPathItem(restPath + "/{uuid}", instanceItem);
+        }
+    }
+
+    private static void tagPathItem(PathItem item, String tag) {
+        for (Operation op : item.readOperations()) {
+            op.addTagsItem(tag);
         }
     }
 
@@ -456,7 +483,7 @@ public class OpenApiSpecGenerator {
      * Falls back to true when moduleClassesDir is not set (generates everything).
      */
     private boolean isModuleOwnedHandler(DelegatingResourceHandler<?> handler) {
-        if (moduleClassesDir == null || moduleClassesDir.isEmpty()) {
+        if (ownedLocations == null || ownedLocations.isEmpty()) {
             return true;
         }
         try {
@@ -465,8 +492,12 @@ public class OpenApiSpecGenerator {
                 return false;
             }
             java.io.File handlerLocation = new java.io.File(cs.getLocation().toURI()).getCanonicalFile();
-            java.io.File classesDir = new java.io.File(moduleClassesDir).getCanonicalFile();
-            return handlerLocation.equals(classesDir);
+            for (String owned : ownedLocations) {
+                if (handlerLocation.equals(new java.io.File(owned).getCanonicalFile())) {
+                    return true;
+                }
+            }
+            return false;
         } catch (Exception e) {
             log.warn("Could not determine code source for {}: {}", handler.getClass().getName(), e.getMessage());
             return false;

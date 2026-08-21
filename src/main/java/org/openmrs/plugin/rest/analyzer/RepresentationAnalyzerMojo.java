@@ -143,6 +143,36 @@ private void prepareOutputDirectory() {
         }
     }
 
+    /**
+     * Returns a semicolon-delimited list of file paths considered "owned" by this module:
+     * the module's own target/classes plus any artifact in the module classpath that shares
+     * the same groupId and whose artifactId starts with the parent module's artifactId prefix.
+     *
+     * This handles multi-module projects (e.g. webservices.rest) where resource handlers live
+     * in a sibling sub-module (omod-common) rather than the omod's own target/classes.
+     */
+    private String buildOwnedLocations(List<String> moduleClasspath) {
+        List<String> owned = new ArrayList<>();
+        owned.add(project.getBuild().getOutputDirectory());
+
+        org.apache.maven.project.MavenProject parent = project.getParent();
+        String prefix = (parent != null && project.getGroupId().equals(parent.getGroupId()))
+                ? parent.getArtifactId()
+                : project.getArtifactId();
+        String groupId = project.getGroupId();
+
+        for (org.apache.maven.artifact.Artifact artifact : (java.util.Set<org.apache.maven.artifact.Artifact>) project.getArtifacts()) {
+            if (groupId.equals(artifact.getGroupId())
+                    && artifact.getArtifactId().startsWith(prefix)
+                    && artifact.getFile() != null) {
+                owned.add(artifact.getFile().getAbsolutePath());
+                log.debug("Owned artifact: {}", artifact.getArtifactId());
+            }
+        }
+
+        return String.join(";", owned);
+    }
+
     private void runGeneratorDirectly() throws MojoExecutionException {
         URL[] pluginUrls = ((URLClassLoader) getClass().getClassLoader()).getURLs();
 
@@ -175,28 +205,28 @@ private void prepareOutputDirectory() {
             }
         }
 
-        // omdCommonJarPath: the path to the omd-common JAR whose webModuleApplicationContext.xml
+        // omodCommonJarPath: the path to the omod-common JAR whose webModuleApplicationContext.xml
         // will be loaded into Spring. MUST match the version of RestServiceImpl that gets loaded —
         // i.e., the version in the MODULE's classpath. Newer versions may inject properties (like
         // executorService) that didn't exist on the class in older versions, causing
         // NotWritablePropertyException. Search the module classpath first; fall back to the plugin
-        // ClassRealm only if the module doesn't carry omd-common (unusual but possible).
-        String omdCommonJarPath = null;
+        // ClassRealm only if the module doesn't carry omod-common (unusual but possible).
+        String omodCommonJarPath = null;
         for (String path : moduleClasspath) {
             String fileName = new File(path).getName();
             if (fileName.startsWith("webservices.rest-omod-common-") && !fileName.contains("-tests")) {
-                omdCommonJarPath = path;
-                log.debug("Found omd-common in module classpath: {}", fileName);
+                omodCommonJarPath = path;
+                log.debug("Found omod-common in module classpath: {}", fileName);
                 break;
             }
         }
 
         // Generator classloader: only plugin tool-chain JARs.
         // Also collect javax.servlet-api JAR (for injection into module CL when module lacks
-        // Servlet 3+), and fall back to the plugin's omd-common if the module doesn't carry it.
+        // Servlet 3+), and fall back to the plugin's omod-common if the module doesn't carry it.
         List<URL> generatorUrls = new ArrayList<>();
         URL pluginServletApiUrl = null;
-        String pluginOmdCommonJarPath = null;
+        String pluginOmodCommonJarPath = null;
         for (URL url : pluginUrls) {
             String path = url.getPath();
             String fileName = path.substring(path.lastIndexOf('/') + 1);
@@ -208,15 +238,21 @@ private void prepareOutputDirectory() {
                 pluginServletApiUrl = url;
             }
             if (fileName.startsWith("webservices.rest-omod-common-") && !fileName.contains("-tests")) {
-                pluginOmdCommonJarPath = path;
+                pluginOmodCommonJarPath = path;
             }
         }
-        if (omdCommonJarPath == null && pluginOmdCommonJarPath != null) {
-            omdCommonJarPath = pluginOmdCommonJarPath;
-            log.debug("omd-common not in module classpath; falling back to plugin version");
+        if (omodCommonJarPath == null && pluginOmodCommonJarPath != null) {
+            omodCommonJarPath = pluginOmodCommonJarPath;
+            log.debug("omod-common not in module classpath; falling back to plugin version");
         }
 
-        log.info("omdCommonJarPath: {}", omdCommonJarPath != null ? omdCommonJarPath : "(not found)");
+        log.info("omodCommonJarPath: {}", omodCommonJarPath != null ? omodCommonJarPath : "(not found)");
+
+        // Owned locations: this module's compiled output plus any classpath artifact that
+        // belongs to the same Maven project (same groupId, artifactId starts with the parent
+        // module name). This handles multi-module projects like webservices.rest where the
+        // resource handlers live in omod-common rather than the omod's own target/classes.
+        String ownedLocations = buildOwnedLocations(moduleClasspath);
 
         // Inject Servlet 3+ API into module CL if the module doesn't already provide it.
         if (!moduleHasServlet3 && pluginServletApiUrl != null) {
@@ -249,8 +285,9 @@ private void prepareOutputDirectory() {
             Class<?> generatorClass = generatorCL.loadClass(
                     "org.openmrs.plugin.rest.analyzer.OpenApiSpecGenerator");
             Object generator = generatorClass.getDeclaredConstructor().newInstance();
-            generatorClass.getMethod("setup", String.class, String.class).invoke(generator,
-                    project.getBuild().getOutputDirectory(), omdCommonJarPath != null ? omdCommonJarPath : "");
+            generatorClass.getMethod("setup", String.class, String.class, String.class, String.class).invoke(generator,
+                    ownedLocations, omodCommonJarPath != null ? omodCommonJarPath : "",
+                    project.getArtifactId(), project.getBuild().getOutputDirectory());
             generatorClass.getMethod("generateOpenAPISpec", String.class, String.class).invoke(generator, getOutputDirectory(), getOutputFileName());
 
         } catch (InvocationTargetException e) {
