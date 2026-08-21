@@ -5,7 +5,7 @@ JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-8-openjdk-amd64}"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <module-path>" >&2
-    echo "  e.g. $0 ../openmrs-module-queue" >&2
+    echo "  e.g. $0 ../openmrs-module-webservices.rest" >&2
     exit 1
 fi
 
