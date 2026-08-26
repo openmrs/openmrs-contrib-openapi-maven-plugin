@@ -13,6 +13,7 @@ import org.openmrs.module.webservices.rest.web.resource.api.Listable;
 import org.openmrs.module.webservices.rest.web.resource.api.Purgeable;
 import org.openmrs.module.webservices.rest.web.resource.api.Retrievable;
 import org.openmrs.module.webservices.rest.web.resource.api.Searchable;
+import org.openmrs.module.webservices.rest.web.resource.api.SubResource;
 import org.openmrs.module.webservices.rest.web.resource.api.Updatable;
 import org.openmrs.module.webservices.rest.web.resource.api.Uploadable;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
@@ -251,6 +252,11 @@ public class OpenApiSpecGenerator {
      * corresponds to specific HTTP routes.
      */
     private static void addPathsForHandler(DelegatingResourceHandler<?> handler, String resourceName, io.swagger.v3.oas.models.Paths paths) {
+        if (handler instanceof SubResource) {
+            addSubResourcePaths(handler, resourceName, paths);
+            return;
+        }
+
         String restPath = OpenMRSResourceModelResolver.getResourceRestPath(handler);
         String schemaRef = "#/components/schemas/";
 
@@ -357,6 +363,154 @@ public class OpenApiSpecGenerator {
             tagPathItem(instanceItem, "Resources");
             paths.addPathItem(restPath + "/{uuid}", instanceItem);
         }
+    }
+
+    /**
+     * Builds the paths for a {@code @SubResource}, which is dispatched by
+     * {@code MainSubResourceController} rather than {@code MainResourceController}. Two things
+     * differ from a plain resource:
+     * <ul>
+     * <li>every route is nested under the parent's UUID
+     * ({@code /{resource}/{parentUuid}/{subResource}})</li>
+     * <li>the operation set comes from the {@code SubResource} interface, not from the
+     * Retrievable/Listable/Creatable/... ability interfaces — a {@code DelegatingSubResource}
+     * implements none of those, so the ability checks used for plain resources all miss and the
+     * sub-resource would otherwise be documented with no endpoints at all</li>
+     * </ul>
+     * {@code MainSubResourceController}'s route table is identical in REST 3.6.x and 4.0.x, so one
+     * shape covers both.
+     */
+    private static void addSubResourcePaths(DelegatingResourceHandler<?> handler, String resourceName,
+            io.swagger.v3.oas.models.Paths paths) {
+        String restPath = OpenMRSResourceModelResolver.getResourceRestPath(handler);
+        if (!restPath.contains("{parentUuid}")) {
+            // getResourceRestPath() could not resolve the parent and fell back to a flat path (it
+            // warns when it does). There is no parent UUID to nest under, and emitting anyway would
+            // declare a parentUuid parameter with no matching template variable — an invalid spec.
+            return;
+        }
+        String schemaRef = "#/components/schemas/";
+        String parentName = OpenMRSResourceModelResolver.getParentResourceName(handler);
+        String ofParent = parentName != null ? " of a " + parentName : " of its parent";
+
+        // ---- Collection path (parent UUID only): GET getAll, POST create, PUT replace ----
+        PathItem collectionItem = new PathItem();
+
+        Schema<?> resultItems = new Schema<>().$ref(schemaRef + resourceName + "Get_ref");
+        Schema<?> responseBody = new ObjectSchema()
+            .addProperty("results", new ArraySchema().items(resultItems))
+            .addProperty("links", new ArraySchema().items(new ObjectSchema()));
+        collectionItem.get(new Operation()
+            .summary("List the " + resourceName + " sub-resources" + ofParent)
+            .addParametersItem(parentUuidParam(parentName))
+            .addParametersItem(vParam())
+            .responses(new ApiResponses().addApiResponse("200",
+                new ApiResponse().description("Success").content(jsonContent(responseBody)))));
+
+        // A handler that refuses to describe its creatable properties (CustomDatatypeHandler and
+        // ObsReferenceRange both throw from save()) genuinely cannot be created, and has no
+        // <Resource>Create schema to point a request body at.
+        boolean creatable = OpenMRSResourceModelResolver.hasCreateSchema(handler);
+        if (creatable) {
+            collectionItem.post(new Operation()
+                .summary("Add a " + resourceName + " to a " + (parentName != null ? parentName : "parent"))
+                .addParametersItem(parentUuidParam(parentName))
+                .requestBody(new RequestBody().required(true).content(
+                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Create"))))
+                .responses(new ApiResponses().addApiResponse("201",
+                    new ApiResponse().description("Created").content(
+                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get_default"))))));
+        }
+
+        // PUT is the one operation that is statically detectable: DelegatingSubResource.put()
+        // throws ResourceDoesNotSupportOperationException unless a subclass overrides it, whereas
+        // delete() and purge() are abstract in BaseDelegatingResource and so are always present
+        // (frequently as bodies that just throw). The other operations therefore document the
+        // superset, exactly as they already do for plain resources.
+        if (overridesPut(handler) && creatable) {
+            collectionItem.put(new Operation()
+                .summary("Replace the " + resourceName + " sub-resources" + ofParent)
+                .addParametersItem(parentUuidParam(parentName))
+                .requestBody(new RequestBody().required(true).content(
+                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Create"))))
+                .responses(new ApiResponses().addApiResponse("204",
+                    new ApiResponse().description("No Content"))));
+        }
+
+        // MainSubResourceController also maps DELETE on the collection path, but it calls
+        // res.delete(parentUuid, null, ...) and DelegatingSubResource resolves that null uuid via
+        // getByUniqueId(null), which cannot work — so it is deliberately not documented.
+
+        tagPathItem(collectionItem, "Resources");
+        paths.addPathItem(restPath, collectionItem);
+
+        // ---- Instance path (parent UUID + own UUID): GET retrieve, POST update, DELETE ----
+        PathItem instanceItem = new PathItem();
+        Parameter uuidParam = new Parameter().name("uuid").in("path").required(true)
+            .description("UUID of the " + resourceName)
+            .schema(new Schema<>().type("string"));
+
+        instanceItem.get(new Operation()
+            .summary("Retrieve a " + resourceName + " by UUID")
+            .addParametersItem(parentUuidParam(parentName))
+            .addParametersItem(uuidParam)
+            .addParametersItem(vParam())
+            .responses(new ApiResponses().addApiResponse("200",
+                new ApiResponse().description("Success").content(
+                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get"))))));
+
+        if (OpenMRSResourceModelResolver.hasUpdateSchema(handler)) {
+            instanceItem.post(new Operation()
+                .summary("Update a " + resourceName)
+                .addParametersItem(parentUuidParam(parentName))
+                .addParametersItem(uuidParam)
+                .requestBody(new RequestBody().required(true).content(
+                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Update"))))
+                .responses(new ApiResponses().addApiResponse("200",
+                    new ApiResponse().description("Updated").content(
+                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get_default"))))));
+        }
+
+        instanceItem.delete(new Operation()
+            .summary("Void, retire, or permanently purge a " + resourceName)
+            .addParametersItem(parentUuidParam(parentName))
+            .addParametersItem(uuidParam)
+            .addParametersItem(new Parameter().name("reason").in("query")
+                .description("Reason for voiding or retiring")
+                .schema(new Schema<>().type("string")))
+            .addParametersItem(new Parameter().name("purge").in("query")
+                .description("Set to true to permanently delete instead of voiding or retiring")
+                .schema(new Schema<>().type("boolean")))
+            .responses(new ApiResponses().addApiResponse("204",
+                new ApiResponse().description("No Content"))));
+
+        tagPathItem(instanceItem, "Resources");
+        paths.addPathItem(restPath + "/{uuid}", instanceItem);
+    }
+
+    /**
+     * Whether the handler overrides {@code SubResource.put()}, which
+     * {@code DelegatingSubResource} implements as an unconditional
+     * {@code ResourceDoesNotSupportOperationException}. Returns false when the REST module on the
+     * classpath has no {@code put} at all.
+     */
+    private static boolean overridesPut(DelegatingResourceHandler<?> handler) {
+        try {
+            java.lang.reflect.Method put = handler.getClass().getMethod("put", String.class,
+                org.openmrs.module.webservices.rest.SimpleObject.class,
+                org.openmrs.module.webservices.rest.web.RequestContext.class);
+            return !org.openmrs.module.webservices.rest.web.resource.impl.DelegatingSubResource.class
+                .equals(put.getDeclaringClass());
+        } catch (NoSuchMethodException e) {
+            return false;
+        }
+    }
+
+    /** The {parentUuid} path variable that every MainSubResourceController route carries. */
+    private static Parameter parentUuidParam(String parentName) {
+        return new Parameter().name("parentUuid").in("path").required(true)
+            .description("UUID of the parent " + (parentName != null ? parentName : "resource"))
+            .schema(new Schema<>().type("string"));
     }
 
     private static void tagPathItem(PathItem item, String tag) {

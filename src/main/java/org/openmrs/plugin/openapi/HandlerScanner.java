@@ -2,7 +2,6 @@ package org.openmrs.plugin.openapi;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -28,8 +27,7 @@ import org.springframework.core.type.filter.TypeFilter;
  * Discovers REST resource handlers and Spring controllers by scanning the classpath, without
  * starting a Spring context or the OpenMRS {@code RestService}.
  * <p>
- * This mirrors {@code RestServiceImpl.initializeResources()} and
- * {@code RestServiceImpl.getResourceHandlers()} exactly:
+ * This follows {@code RestServiceImpl.initializeResources()}:
  * <ol>
  * <li>scan {@code classpath*:org/openmrs/&#42;&#42;/*.class} for concrete implementations of
  * {@code Resource} (the same pattern {@code OpenmrsClassScanner} uses)</li>
@@ -39,6 +37,10 @@ import org.springframework.core.type.filter.TypeFilter;
  * <li>append {@code DelegatingSubclassHandler}s, which the REST module obtains from Spring via
  * {@code Context.getRegisteredComponents(...)}</li>
  * </ol>
+ * <p>
+ * It deliberately returns one handler per REST <em>name</em>, which is a superset of what
+ * {@code RestServiceImpl.getResourceHandlers()} returns — see the comment in
+ * {@link #findResourceHandlers()}.
  */
 public class HandlerScanner {
 
@@ -76,10 +78,21 @@ public class HandlerScanner {
                 org.openmrs.module.webservices.rest.web.resource.api.Resource.class));
         System.out.println("Scanned classpath: " + resourceClasses.size() + " concrete Resource implementations");
 
-        // Mirrors RestServiceImpl: resources are de-duplicated by name (lowest order wins) but
-        // collected by supported class, which is what getResourceHandlers() iterates.
-        Map<String, ResourceDefinition> byName = new HashMap<String, ResourceDefinition>();
-        Map<Class<?>, Object> bySupportedClass = new LinkedHashMap<Class<?>, Object>();
+        // Resources are de-duplicated by REST name, lowest order wins — the same rule
+        // RestServiceImpl.isResourceToBeAdded() applies when filling resourceDefinitionsByNames.
+        //
+        // Deliberately NOT keyed by supportedClass. RestServiceImpl keeps a second map for that
+        // (resourcesBySupportedClasses), and getResourceHandlers() iterates it — but a map keyed by
+        // supported class holds only one entry per class, so when two resources describe the same
+        // domain object one of them disappears. openmrs-module-queue does exactly that:
+        // QueueEntryResource (v1/queue-entry) and QueueEntrySubResource (v1/queue/entry) both
+        // declare supportedClass = QueueEntry.class, and mirroring getResourceHandlers() silently
+        // dropped whichever was scanned second.
+        //
+        // Both are live endpoints — MainResourceController and MainSubResourceController each
+        // resolve them through getResourceByName(), i.e. through resourceDefinitionsByNames. The
+        // API surface is the set of names, so that is what gets documented.
+        Map<String, ResourceDefinition> byName = new LinkedHashMap<String, ResourceDefinition>();
 
         for (Class<?> resourceClass : resourceClasses) {
             ResourceMetadata metadata = getResourceMetadata(resourceClass);
@@ -100,13 +113,12 @@ public class HandlerScanner {
                 continue;
             }
             byName.put(metadata.name, new ResourceDefinition(instance, metadata.order));
-            bySupportedClass.put(metadata.supportedClass, instance);
         }
 
         List<DelegatingResourceHandler<?>> handlers = new ArrayList<DelegatingResourceHandler<?>>();
-        for (Object resource : bySupportedClass.values()) {
-            if (resource instanceof DelegatingResourceHandler) {
-                handlers.add((DelegatingResourceHandler<?>) resource);
+        for (ResourceDefinition definition : byName.values()) {
+            if (definition.instance instanceof DelegatingResourceHandler) {
+                handlers.add((DelegatingResourceHandler<?>) definition.instance);
             }
         }
         for (DelegatingSubclassHandler<?, ?> subclassHandler : findSubclassHandlers()) {

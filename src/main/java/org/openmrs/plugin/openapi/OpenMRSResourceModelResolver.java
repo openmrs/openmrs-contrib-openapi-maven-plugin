@@ -13,6 +13,8 @@ import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.apache.commons.beanutils.PropertyUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -45,6 +47,7 @@ import org.openmrs.module.webservices.rest.web.response.ResourceDoesNotSupportOp
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.type.TypeFactory;
 
@@ -62,6 +65,9 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
 
   public static final Representation[] STANDARD_REPRESENTATIONS = {Representation.DEFAULT, Representation.FULL, Representation.REF};
 
+  /** Trailing "Resource", optionally followed by a version suffix such as "1_8" or "2_0". */
+  private static final Pattern RESOURCE_SUFFIX = Pattern.compile("Resource(\\d+(_\\d+)*)?$");
+
   private static final List<Class<?>> RESOURCE_ABILITY_INTERFACES = java.util.Arrays.asList(
       Retrievable.class, Creatable.class, Updatable.class, Deletable.class,
       Searchable.class, Listable.class, Purgeable.class, Uploadable.class, SubResource.class
@@ -72,7 +78,30 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
   );
 
   public OpenMRSResourceModelResolver(ObjectMapper mapper) {
-    super(mapper);
+    super(withStablePropertyOrder(mapper));
+  }
+
+  /**
+   * Returns a copy of the mapper that orders bean properties alphabetically.
+   * <p>
+   * Schemas built by {@code super.resolve()} come from Jackson's bean introspection, which lists
+   * fields in declaration order and then appends getter-only properties in
+   * {@code Class.getDeclaredMethods()} order — and that order has no definition and genuinely
+   * varies between JVM runs. It made {@code org.openmrs.module.Module} (whose
+   * {@code getModuleIdAsPath()} has no backing field) and {@code org.w3c.dom.Document} (all
+   * getter-only) emit a different property order on each run, so consecutive runs against the same
+   * module produced different bytes.
+   * <p>
+   * Only bean-introspected schemas are affected. Representation schemas are built by this class
+   * from a {@code DelegatingResourceDescription} and keep that description's own order.
+   * <p>
+   * The mapper is copied rather than reconfigured: {@code Json31.mapper()} is a shared singleton
+   * in swagger-core and is also used to serialise the output.
+   */
+  private static ObjectMapper withStablePropertyOrder(ObjectMapper mapper) {
+    ObjectMapper copy = mapper.copy();
+    copy.setConfig(copy.getSerializationConfig().with(MapperFeature.SORT_PROPERTIES_ALPHABETICALLY));
+    return copy;
   }
 
   @Override
@@ -284,6 +313,24 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
     log.info("Generated schemas for " + getResourceName(handler) + " representations: " + StringUtils.join(generatedReps, ", "));
 
     return ret;
+  }
+
+  /**
+   * Whether a {@code <Resource>Create} schema will be generated for this handler. Uses exactly the
+   * predicate schema generation uses, so a path can never end up referencing a schema that was
+   * never defined.
+   */
+  public static boolean hasCreateSchema(DelegatingResourceHandler<?> handler) {
+    return getCreateDescription(handler) != null;
+  }
+
+  /**
+   * Whether a {@code <Resource>Update} schema will be generated for this handler.
+   *
+   * @see #hasCreateSchema
+   */
+  public static boolean hasUpdateSchema(DelegatingResourceHandler<?> handler) {
+    return getUpdatableDescription(handler) != null;
   }
 
   private static DelegatingResourceDescription getCreateDescription(DelegatingResourceHandler<?> handler) {
@@ -534,7 +581,11 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
     // Walk most-derived -> base using putIfAbsent so the most-derived handler's getter wins.
     Class<?> handlerClass = handler.getClass();
     while (handlerClass != null && !handlerClass.equals(Object.class)) {
-      for (Method m : handlerClass.getDeclaredMethods()) {
+      // getDeclaredMethods() has no defined order, and insertion order here becomes the property
+      // order of the custom representation schema. Sort, as the @RepHandler scan above does.
+      Method[] declared = handlerClass.getDeclaredMethods();
+      Arrays.sort(declared, Comparator.comparing(Method::getName).thenComparing(Method::toString));
+      for (Method m : declared) {
         PropertyGetter getter = m.getAnnotation(PropertyGetter.class);
         if (getter != null) {
           properties.putIfAbsent(getter.value(), m);
@@ -722,11 +773,45 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
     return "./" + resourceName + ".json#/schemas/" + resourceName + "Get_" + rep.getRepresentation();
   }
 
+  /**
+   * The name a handler's schemas and output file are keyed by, derived by stripping the trailing
+   * {@code Resource<version>} suffix from its class name
+   * (e.g. {@code PersonNameResource1_8} -> {@code PersonName}).
+   * <p>
+   * The suffix is anchored at the end rather than matched at its first occurrence, because a
+   * sub-resource class legitimately contains "Resource" twice: truncating at the first one made
+   * {@code FormResourceResource1_9} and {@code FormResource1_9} both claim the name "Form", so the
+   * sub-resource silently overwrote the parent resource's file. Anchoring at the end also stops a
+   * class whose name begins with "Resource" from yielding an empty name.
+   */
   public static String getResourceName(DelegatingResourceHandler<?> handler) {
-      String className = handler.getClass().getSimpleName();
-      int index = className.indexOf("Resource");
-      if (index >= 0) {
-          return className.substring(0, index);
+      return stripResourceSuffix(handler.getClass().getSimpleName());
+  }
+
+  /**
+   * The name of a sub-resource's parent resource (e.g. "Person" for {@code PersonNameResource1_8}),
+   * or null when the handler is not a {@code @SubResource}. Used only for human-readable summaries.
+   */
+  public static String getParentResourceName(DelegatingResourceHandler<?> handler) {
+      org.openmrs.module.webservices.rest.web.annotation.SubResource sub = subResourceAnnotation(handler);
+      return sub == null ? null : stripResourceSuffix(sub.parent().getSimpleName());
+  }
+
+  /**
+   * The {@code @SubResource} annotation declared on the handler's own class, or null. The
+   * annotation is not {@code @Inherited} and the REST module reads it off the concrete class too
+   * ({@code DelegatingSubResource.getUri()}), so this deliberately does not walk superclasses.
+   */
+  private static org.openmrs.module.webservices.rest.web.annotation.SubResource subResourceAnnotation(
+          DelegatingResourceHandler<?> handler) {
+      return handler.getClass().getAnnotation(
+          org.openmrs.module.webservices.rest.web.annotation.SubResource.class);
+  }
+
+  private static String stripResourceSuffix(String className) {
+      Matcher matcher = RESOURCE_SUFFIX.matcher(className);
+      if (matcher.find() && matcher.start() > 0) {
+          return className.substring(0, matcher.start());
       }
       return className;
   }
@@ -769,9 +854,28 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
    * Returns the REST path for a resource handler by reading the name() field of its
    * {@code @Resource} annotation (e.g. "v1/visit" -> "/ws/rest/v1/visit").
    * All paths use the /ws servlet prefix to match the actual OpenMRS mount point.
+   * <p>
+   * A {@code @SubResource} has no {@code @Resource} of its own; it is reached through its parent
+   * and served by {@code MainSubResourceController}, whose routes are
+   * {@code /{resource}/{parentUuid}/{subResource}}. So the path is the parent's name, the parent
+   * UUID, then the sub-resource's path (e.g. "/ws/rest/v1/person/{parentUuid}/name").
+   * <p>
    * Falls back to lowercasing the resource name if no annotation is found.
    */
   public static String getResourceRestPath(DelegatingResourceHandler<?> handler) {
+    org.openmrs.module.webservices.rest.web.annotation.SubResource sub = subResourceAnnotation(handler);
+    if (sub != null) {
+      org.openmrs.module.webservices.rest.web.annotation.Resource parent = sub.parent()
+          .getAnnotation(org.openmrs.module.webservices.rest.web.annotation.Resource.class);
+      if (parent != null && !parent.name().isEmpty()) {
+        return "/ws/rest/" + parent.name() + "/{parentUuid}/" + sub.path();
+      }
+      // System.out, not the logger: SLF4J from inside the isolated generator classloader does
+      // not reach Maven's output, and a sub-resource landing on a flat path is worth seeing.
+      System.out.println("WARN  sub-resource " + handler.getClass().getName() + " names parent "
+          + sub.parent().getName() + ", which carries no @Resource annotation; "
+          + "falling back to a flat path");
+    }
     Class<?> cls = handler.getClass();
     while (cls != null) {
       org.openmrs.module.webservices.rest.web.annotation.Resource ann =
