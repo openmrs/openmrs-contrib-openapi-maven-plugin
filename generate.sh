@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-8-openjdk-amd64}"
+JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <module-path>" >&2
@@ -21,11 +21,11 @@ fi
 if [ -f "$MODULE_PATH/omod/pom.xml" ]; then
     TARGET_POM="$MODULE_PATH/omod/pom.xml"
     TARGET_CLASSES="$MODULE_PATH/omod/target/classes"
-    OUTPUT_DIR="$MODULE_PATH/omod/target/openapi"
+    OUTPUT_DIR="$MODULE_PATH/omod/target/classes/META-INF/openapi"
 else
     TARGET_POM="$MODULE_PATH/pom.xml"
     TARGET_CLASSES="$MODULE_PATH/target/classes"
-    OUTPUT_DIR="$MODULE_PATH/target/openapi"
+    OUTPUT_DIR="$MODULE_PATH/target/classes/META-INF/openapi"
 fi
 
 if [ ! -d "$TARGET_CLASSES" ]; then
@@ -34,7 +34,7 @@ if [ ! -d "$TARGET_CLASSES" ]; then
     exit 1
 fi
 
-JAVA_HOME="$JAVA_HOME" mvn openmrs-rest-analyzer:analyze-representations -f "$TARGET_POM"
+JAVA_HOME="$JAVA_HOME" mvn openmrs-openapi:generate -f "$TARGET_POM"
 
 echo ""
 echo "=== Output ==="

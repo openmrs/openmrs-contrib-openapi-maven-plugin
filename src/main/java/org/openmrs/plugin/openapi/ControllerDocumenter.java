@@ -1,4 +1,4 @@
-package org.openmrs.plugin.rest.analyzer;
+package org.openmrs.plugin.openapi;
 
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.swagger.v3.core.converter.AnnotatedType;
@@ -19,7 +19,6 @@ import io.swagger.v3.oas.models.responses.ApiResponse;
 import io.swagger.v3.oas.models.responses.ApiResponses;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.context.ApplicationContext;
 import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Controller;
 import org.springframework.web.bind.annotation.DeleteMapping;
@@ -42,6 +41,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -49,8 +49,9 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * Discovers all @Controller beans in the Spring context (except the two resource-dispatch
- * controllers) and generates per-controller OpenAPI documentation from @RequestMapping annotations.
+ * Generates per-controller OpenAPI documentation from {@code @RequestMapping} annotations, for the
+ * {@code @Controller} classes {@link HandlerScanner} found on the classpath (except the two
+ * resource-dispatch controllers).
  */
 public class ControllerDocumenter {
 
@@ -64,11 +65,10 @@ public class ControllerDocumenter {
     private Map<String, Schema<?>> resourceSchemas;
 
     /**
-     * Discovers all @Controller beans, generates per-controller JSON files under controllersDir,
-     * merges controller DTO schemas into mainComponents, and returns a Paths map for inclusion
-     * in the main openapi.json.
+     * Generates per-controller JSON files under controllersDir, merges controller DTO schemas into
+     * mainComponents, and returns a Paths map for inclusion in the main openapi.json.
      */
-    public Paths document(ApplicationContext ctx, Path controllersDir, Components mainComponents,
+    public Paths document(List<Class<?>> controllerClasses, Path controllersDir, Components mainComponents,
             String ownedLocationsSemicolon) throws IOException {
         Paths allPaths = new Paths();
         com.fasterxml.jackson.databind.ObjectMapper mapper = io.swagger.v3.core.util.Json.mapper();
@@ -83,16 +83,27 @@ public class ControllerDocumenter {
                 ? new java.util.HashSet<String>(java.util.Arrays.asList(ownedLocationsSemicolon.split(";")))
                 : null;
 
-        List<Object> beans = new ArrayList<>(ctx.getBeansWithAnnotation(Controller.class).values());
-        beans.sort((a, b) -> targetClass(a).getSimpleName().compareTo(targetClass(b).getSimpleName()));
+        // Controllers arrive as classes from a classpath scan rather than as Spring beans; only
+        // bean.getClass() was ever used here, so the two are equivalent (and no proxy unwrapping
+        // is needed for scanned classes).
+        List<Class<?>> beans = new ArrayList<>(controllerClasses);
+        beans.sort((a, b) -> a.getSimpleName().compareTo(b.getSimpleName()));
 
-        for (Object bean : beans) {
-            Class<?> cls = targetClass(bean);
-            if (EXCLUDED_CONTROLLERS.contains(cls.getSimpleName())) continue;
+        int documented = 0;
+        List<String> skipped = new ArrayList<>();
+
+        for (Class<?> cls : beans) {
             if (ownedLocations != null && !isModuleOwned(cls, ownedLocations)) continue;
+            if (EXCLUDED_CONTROLLERS.contains(cls.getSimpleName())) {
+                skipped.add(cls.getSimpleName() + " (resource-dispatch controller)");
+                continue;
+            }
 
             String basePath = classBasePath(cls);
-            if (basePath == null) continue;
+            if (basePath == null) {
+                skipped.add(cls.getSimpleName() + " (no class-level @RequestMapping path)");
+                continue;
+            }
 
             // Fresh converters per controller to avoid schema accumulation across controllers.
             // The resource-ref converter runs first: any type already registered as a REST
@@ -115,12 +126,24 @@ public class ControllerDocumenter {
             Map<String, Schema<?>> controllerSchemas = new LinkedHashMap<>();
             Paths controllerPaths = new Paths();
 
-            for (Method method : cls.getDeclaredMethods()) {
+            // getDeclaredMethods() has no defined order and varies between JVM versions. That
+            // matters when two handlers collide on the same path and verb (e.g.
+            // ConceptReferenceController1_9 has a form-consuming and a JSON-consuming POST on
+            // /conceptreferences) — whichever is processed last wins. Sort so the winner is at
+            // least stable across runs and JVMs.
+            Method[] declaredMethods = cls.getDeclaredMethods();
+            Arrays.sort(declaredMethods,
+                    Comparator.comparing(Method::getName).thenComparing(Method::toString));
+            for (Method method : declaredMethods) {
                 if (!Modifier.isPublic(method.getModifiers())) continue;
                 processMethod(method, basePath, controllerPaths, controllerSchemas, converters);
             }
 
-            if (controllerPaths.isEmpty()) continue;
+            if (controllerPaths.isEmpty()) {
+                skipped.add(cls.getSimpleName() + " (no mapped request methods)");
+                continue;
+            }
+            documented++;
 
             // Merge controller DTO schemas into the main openapi.json components.
             // Never overwrite existing resource $ref placeholders.
@@ -148,6 +171,14 @@ public class ControllerDocumenter {
             Path outFile = controllersDir.resolve(cls.getSimpleName() + ".json");
             Files.write(outFile, mapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(root));
             System.out.println("Wrote controller file: " + outFile.toAbsolutePath());
+        }
+
+        System.out.println("Documented " + documented + " controllers from this module.");
+        if (!skipped.isEmpty()) {
+            System.out.println("Skipped " + skipped.size() + " module controller(s):");
+            for (String reason : skipped) {
+                System.out.println("  " + reason);
+            }
         }
 
         return allPaths;
@@ -337,15 +368,6 @@ public class ControllerDocumenter {
 
     // ---- static helpers ----
 
-    private static Class<?> targetClass(Object bean) {
-        Class<?> cls = bean.getClass();
-        // Unwrap CGLIB proxies (class names contain "$$EnhancerBySpringCGLIB$$" etc.)
-        while (cls.getName().contains("$$")) {
-            cls = cls.getSuperclass();
-        }
-        return cls;
-    }
-
     private static String classBasePath(Class<?> cls) {
         RequestMapping rm = cls.getAnnotation(RequestMapping.class);
         if (rm == null) return "";  // no class-level mapping; method annotations carry the full path
@@ -354,19 +376,7 @@ public class ControllerDocumenter {
     }
 
     private static boolean isModuleOwned(Class<?> cls, java.util.Set<String> ownedLocations) {
-        try {
-            java.security.CodeSource cs = cls.getProtectionDomain().getCodeSource();
-            if (cs == null || cs.getLocation() == null) return false;
-            java.io.File classLocation = new java.io.File(cs.getLocation().toURI()).getCanonicalFile();
-            for (String owned : ownedLocations) {
-                if (classLocation.equals(new java.io.File(owned).getCanonicalFile())) {
-                    return true;
-                }
-            }
-            return false;
-        } catch (Exception e) {
-            return false;
-        }
+        return ModuleOwnership.isOwned(cls, ownedLocations);
     }
 
     // Strips the /rest/**/ wildcard prefix used by OpenMRS REST controllers, then

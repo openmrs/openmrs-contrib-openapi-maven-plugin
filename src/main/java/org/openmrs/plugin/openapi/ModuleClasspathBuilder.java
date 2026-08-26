@@ -1,4 +1,4 @@
-package org.openmrs.plugin.rest.analyzer;
+package org.openmrs.plugin.openapi;
 
 import org.apache.maven.artifact.Artifact;
 import org.apache.maven.project.MavenProject;

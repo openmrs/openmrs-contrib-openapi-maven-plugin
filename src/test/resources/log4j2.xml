@@ -6,7 +6,7 @@
         </Console>
     </Appenders>
     <Loggers>
-        <Logger name="org.openmrs.plugin.rest.analyzer.test.OpenmrsOpenapiSpecGeneratorTest" level="info" additivity="false">
+        <Logger name="org.openmrs.plugin.openapi" level="info" additivity="false">
             <AppenderRef ref="Console"/>
         </Logger>
         <Logger name="org.hibernate.orm.deprecation" level="error"/>

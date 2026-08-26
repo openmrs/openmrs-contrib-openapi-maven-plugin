@@ -1,4 +1,4 @@
-package org.openmrs.plugin;
+package org.openmrs.plugin.openapi;
 
 import java.beans.PropertyDescriptor;
 import java.lang.reflect.InvocationTargetException;
@@ -7,6 +7,8 @@ import java.lang.reflect.Modifier;
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -32,7 +34,6 @@ import org.openmrs.module.webservices.rest.web.resource.api.Creatable;
 import org.openmrs.module.webservices.rest.web.resource.api.Deletable;
 import org.openmrs.module.webservices.rest.web.resource.api.Listable;
 import org.openmrs.module.webservices.rest.web.resource.api.Purgeable;
-import org.openmrs.module.webservices.rest.web.resource.api.Resource;
 import org.openmrs.module.webservices.rest.web.resource.api.Retrievable;
 import org.openmrs.module.webservices.rest.web.resource.api.Searchable;
 import org.openmrs.module.webservices.rest.web.resource.api.SubResource;
@@ -55,9 +56,9 @@ import io.swagger.v3.oas.models.media.ArraySchema;
 import io.swagger.v3.oas.models.media.ObjectSchema;
 import io.swagger.v3.oas.models.media.Schema;
 
-public class CustomModelResolver extends ModelResolver {
+public class OpenMRSResourceModelResolver extends ModelResolver {
 
-  private static final Logger log = LoggerFactory.getLogger(CustomModelResolver.class);
+  private static final Logger log = LoggerFactory.getLogger(OpenMRSResourceModelResolver.class);
 
   public static final Representation[] STANDARD_REPRESENTATIONS = {Representation.DEFAULT, Representation.FULL, Representation.REF};
 
@@ -70,7 +71,7 @@ public class CustomModelResolver extends ModelResolver {
       Customizable.class, org.openmrs.Creatable.class, Attributable.class
   );
 
-  public CustomModelResolver(ObjectMapper mapper) {
+  public OpenMRSResourceModelResolver(ObjectMapper mapper) {
     super(mapper);
   }
 
@@ -203,7 +204,10 @@ public class CustomModelResolver extends ModelResolver {
     // scan through methods in handler and look for ones with @RepHandler annotation.
     // mirrors BaseDelegatingResource.asRepresentation(): @RepHandler is only used when
     // getRepresentationDescription() returns null for the representation it covers.
+    // Class.getMethods() has no defined order and genuinely varies between JVM runs, which made
+    // the generated anyOf lists differ run-to-run. Sort so the output is reproducible.
     Method[] methods = handler.getClass().getMethods();
+    Arrays.sort(methods, Comparator.comparing(Method::getName).thenComparing(Method::toString));
     for (Method method : methods) {
       RepHandler repHandler = method.getAnnotation(RepHandler.class);
       if(repHandler != null) {
@@ -436,6 +440,7 @@ public class CustomModelResolver extends ModelResolver {
     T delegate = null;
     try {
       // special case for Concept.datatype to get the ConceptNumeric subclass
+      // TODO: remove this after plan-representation-typing.md is done
       delegate = handler.newDelegate(new SimpleObject().add("datatype", ConceptDatatype.NUMERIC_UUID));
     } catch(ResourceDoesNotSupportOperationException e) {
       // ignore;
@@ -626,7 +631,7 @@ public class CustomModelResolver extends ModelResolver {
     PropertyGetter pg = getter.getAnnotation(PropertyGetter.class);
     if (pg == null) return null;
 
-    // arraySchema() and schema() were added to @PropertyGetter in REST module 3.1+.
+    // arraySchema() and schema() were added to @PropertyGetter in REST module 4.0+.
     // Older modules compile against a version that lacks these elements; calling them
     // throws AbstractMethodError. Treat that as "no hint present".
     try {

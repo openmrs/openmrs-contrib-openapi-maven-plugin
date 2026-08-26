@@ -5,6 +5,7 @@ import java.util.Map;
 
 import org.junit.jupiter.api.Test;
 import org.openmrs.module.webservices.rest.SimpleObject;
+import org.openmrs.plugin.openapi.OpenMRSResourceModelResolver;
 
 import io.swagger.v3.core.converter.AnnotatedType;
 import io.swagger.v3.core.converter.ModelConverters;
@@ -18,7 +19,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
-class CustomModelResolverTest {
+class OpenMRSResourceModelResolverTest {
 
     /**
      * A stand-in for a typed SimpleObject payload, e.g. AuditInfo in the REST module.
@@ -45,7 +46,7 @@ class CustomModelResolverTest {
 
     private static ModelConverters newConverters() {
         ModelConverters converters = new ModelConverters();
-        converters.addConverter(new CustomModelResolver(Json31.mapper()));
+        converters.addConverter(new OpenMRSResourceModelResolver(Json31.mapper()));
         return converters;
     }
 

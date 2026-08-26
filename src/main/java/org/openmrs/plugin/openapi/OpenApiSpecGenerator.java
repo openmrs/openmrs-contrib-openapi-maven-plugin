@@ -1,41 +1,13 @@
-package org.openmrs.plugin.rest.analyzer;
+package org.openmrs.plugin.openapi;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.sql.Connection;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Properties;
-import java.util.stream.Collectors;
 
-import org.dbunit.database.DatabaseConfig;
-import org.dbunit.database.DatabaseConnection;
-import org.dbunit.database.IDatabaseConnection;
-import org.dbunit.dataset.IDataSet;
-import org.dbunit.dataset.xml.FlatXmlDataSetBuilder;
-import org.dbunit.ext.h2.H2DataTypeFactory;
-import org.dbunit.operation.DatabaseOperation;
-import org.hibernate.SessionFactory;
-import org.hibernate.cfg.Environment;
-import org.hibernate.dialect.H2Dialect;
-
-import org.openmrs.Attributable;
-import org.openmrs.Auditable;
-import org.openmrs.Changeable;
-import org.openmrs.Creatable;
-import org.openmrs.FormRecordable;
-import org.openmrs.GlobalProperty;
-import org.openmrs.Retireable;
-import org.openmrs.Voidable;
-import org.openmrs.api.context.Context;
-import org.openmrs.customdatatype.Customizable;
-import org.openmrs.module.webservices.rest.web.RestConstants;
-import org.openmrs.module.webservices.rest.web.api.RestService;
 import org.openmrs.module.webservices.rest.web.resource.api.Deletable;
 import org.openmrs.module.webservices.rest.web.resource.api.Listable;
 import org.openmrs.module.webservices.rest.web.resource.api.Purgeable;
@@ -44,12 +16,8 @@ import org.openmrs.module.webservices.rest.web.resource.api.Searchable;
 import org.openmrs.module.webservices.rest.web.resource.api.Updatable;
 import org.openmrs.module.webservices.rest.web.resource.api.Uploadable;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
-import org.openmrs.plugin.CustomModelResolver;
-import org.openmrs.plugin.OpenmrsResourceAnnotatedType;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.mock.web.MockServletContext;
-import org.springframework.web.context.support.XmlWebApplicationContext;
 
 import io.swagger.v3.core.converter.ModelConverters;
 import io.swagger.v3.core.converter.ResolvedSchema;
@@ -72,137 +40,67 @@ import io.swagger.v3.oas.models.responses.ApiResponses;
 
 /**
  * OpenAPI 3.1 specification generator for OpenMRS REST resources.
- * Uses CustomModelResolver for accurate property type discovery and Swagger-Core models.
+ * Uses OpenMRSResourceModelResolver for accurate property type discovery and Swagger-Core models.
  */
 public class OpenApiSpecGenerator {
 
     private static final Logger log = LoggerFactory.getLogger(OpenApiSpecGenerator.class);
 
-    private org.springframework.web.context.support.XmlWebApplicationContext ctx;
-    private String moduleClassesDir;
     private java.util.Set<String> ownedLocations;
-    private String moduleName;
 
-    public void setup(String ownedLocationsSemicolon, String omodCommonJarPath, String moduleName, String moduleClassesDir) throws Exception {
-        this.moduleClassesDir = moduleClassesDir;
+    private String moduleName;
+    private String moduleVersion;
+
+    private List<DelegatingResourceHandler<?>> handlers;
+    private List<Class<?>> controllerClasses;
+
+    /**
+     * Discovers the module's resource handlers and controllers by reflection.
+     * <p>
+     * No Spring context, no in-memory database and no authenticated session are involved: the
+     * handlers' description methods are almost entirely self-contained, and {@link StubRuntime}
+     * covers the few that reach for the platform. See plan-no-runtime.md for the measurements
+     * behind this.
+     */
+    public void setup(String ownedLocationsSemicolon, String moduleName, String moduleVersion)
+            throws Exception {
         this.moduleName = moduleName;
+        this.moduleVersion = moduleVersion;
         this.ownedLocations = new java.util.HashSet<String>(
                 java.util.Arrays.asList(ownedLocationsSemicolon.split(";")));
         log.info("Owned locations: {}", this.ownedLocations);
-        log.info("=== Setting up OpenAPI Spec Generator ===");
+        log.info("=== Setting up OpenAPI Spec Generator (reflection only) ===");
 
-        final String h2Url = "jdbc:h2:mem:openmrs;DB_CLOSE_DELAY=-1;LOCK_TIMEOUT=10000;IGNORECASE=TRUE";
+        // Must happen before any resource class is loaded, because loading one initialises
+        // RestConstants, whose static initialiser calls Context.getAdministrationService().
+        StubRuntime.install();
 
-        // Step 2: Configure Hibernate runtime properties
-        Properties props = new Properties();
-        props.setProperty(Environment.DIALECT, H2Dialect.class.getName());
-        props.setProperty(Environment.URL, h2Url);
-        props.setProperty(Environment.DRIVER, "org.h2.Driver");
-        props.setProperty(Environment.USER, "sa");
-        props.setProperty(Environment.PASS, "");
-        props.setProperty(Environment.HBM2DDL_AUTO, "create-drop");
-        Context.setRuntimeProperties(props);
+        HandlerScanner scanner = new HandlerScanner(Thread.currentThread().getContextClassLoader(), ownedLocations);
+        handlers = scanner.findResourceHandlers();
+        Collections.sort(handlers, Comparator.comparing(h -> h.getClass().getSimpleName()));
 
-        // Step 3: Start Spring WebApplicationContext with mock servlet context.
-        // Use file: URL for webModuleApplicationContext.xml to load only the target module's own copy,
-        // avoiding double-loading when both omod-common and omod are on the classpath.
-        ctx = new XmlWebApplicationContext();
-        javax.servlet.FilterRegistration.Dynamic noopFilter = new javax.servlet.FilterRegistration.Dynamic() {
-            public void addMappingForServletNames(java.util.EnumSet<javax.servlet.DispatcherType> d, boolean b, String... names) {}
-            public java.util.Collection<String> getServletNameMappings() { return java.util.Collections.emptyList(); }
-            public void addMappingForUrlPatterns(java.util.EnumSet<javax.servlet.DispatcherType> d, boolean b, String... patterns) {}
-            public java.util.Collection<String> getUrlPatternMappings() { return java.util.Collections.emptyList(); }
-            public String getName() { return ""; }
-            public String getClassName() { return ""; }
-            public boolean setInitParameter(String name, String value) { return false; }
-            public String getInitParameter(String name) { return null; }
-            public java.util.Set<String> setInitParameters(java.util.Map<String, String> initParameters) { return java.util.Collections.emptySet(); }
-            public java.util.Map<String, String> getInitParameters() { return java.util.Collections.emptyMap(); }
-            public void setAsyncSupported(boolean isAsyncSupported) {}
-        };
-        ctx.setServletContext(new MockServletContext() {
-            @Override
-            public javax.servlet.FilterRegistration.Dynamic addFilter(String filterName, String className) { return noopFilter; }
-            @Override
-            public javax.servlet.FilterRegistration.Dynamic addFilter(String filterName, javax.servlet.Filter filter) { return noopFilter; }
-            @Override
-            public javax.servlet.FilterRegistration.Dynamic addFilter(String filterName, Class<? extends javax.servlet.Filter> filterClass) { return noopFilter; }
-            @Override
-            public void addListener(String className) {}
-            @Override
-            public <T extends java.util.EventListener> void addListener(T t) {}
-            @Override
-            public void addListener(Class<? extends java.util.EventListener> listenerClass) {}
-            @Override
-            public javax.servlet.ServletRegistration getServletRegistration(String servletName) { return null; }
-            @Override
-            public javax.servlet.ServletRegistration.Dynamic addServlet(String servletName, String className) { return null; }
-            @Override
-            public javax.servlet.ServletRegistration.Dynamic addServlet(String servletName, javax.servlet.Servlet servlet) { return null; }
-            @Override
-            public javax.servlet.ServletRegistration.Dynamic addServlet(String servletName, Class<? extends javax.servlet.Servlet> servletClass) { return null; }
-            @Override
-            public java.util.Map<String, ? extends javax.servlet.ServletRegistration> getServletRegistrations() { return java.util.Collections.emptyMap(); }
-        });
-        List<String> configLocations = new java.util.ArrayList<>(java.util.Arrays.asList(
-            "classpath:applicationContext-service.xml",
-            "classpath*:TestingApplicationContext.xml",
-            "classpath*:moduleApplicationContext.xml",
-            "classpath*:openmrs-servlet.xml"
-        ));
-        // Always load webModuleApplicationContext.xml from webservices.rest-omod-common — it
-        // defines restService, restHelperService, and the component scan for REST controllers.
-        // Using an explicit jar: URL avoids classpath scan ambiguity across two classloaders.
-        // Spring 5's allowBeanDefinitionOverriding defaults to true, so if the target module
-        // also provides webModuleApplicationContext.xml the last definition wins harmlessly.
-        if (omodCommonJarPath != null && !omodCommonJarPath.isEmpty()) {
-            String omodCommonCtxUrl = "jar:file:" + omodCommonJarPath + "!/webModuleApplicationContext.xml";
-            configLocations.add(omodCommonCtxUrl);
-            log.info("Loading REST beans from omod-common: {}", omodCommonCtxUrl);
-        } else {
-            log.warn("omodCommonJarPath is empty — restService bean may not be available");
-        }
-        if (moduleClassesDir != null && !moduleClassesDir.isEmpty()) {
-            java.io.File webModuleCtxFile = new java.io.File(moduleClassesDir, "webModuleApplicationContext.xml");
-            if (webModuleCtxFile.exists()) {
-                configLocations.add("file:" + webModuleCtxFile.getAbsolutePath());
-                log.info("Loading webModuleApplicationContext.xml from: {}", webModuleCtxFile.getAbsolutePath());
-            }
-        }
-        ctx.setConfigLocations(configLocations.toArray(new String[0]));
-        ctx.refresh();
+        // Subclass handlers resolve sibling resources through Context.getService(RestService.class);
+        // answer those from what we just discovered.
+        StubRuntime.registerRestService(handlers);
 
-        // Step 5: Open session, load initial test dataset (contains admin user), authenticate
-        Context.openSession();
-        SessionFactory sessionFactory = (SessionFactory) ctx.getBean("sessionFactory");
-        Connection conn = sessionFactory.getCurrentSession().doReturningWork(c -> c);
-        loadDataSet(conn, "org/openmrs/include/initialInMemoryTestDataSet.xml");
-        conn.commit();
-        Context.authenticate("admin", "test");
-
-        Context.getAdministrationService().saveGlobalProperty(
-            new GlobalProperty(RestConstants.SWAGGER_QUIET_DOCS_GLOBAL_PROPERTY_NAME, "true"));
-        Context.flushSession();
+        controllerClasses = scanner.findControllers();
     }
 
     public void generateOpenAPISpec(String outputDir, String outputFile) {
 
+        // The spec describes one module, so it is titled and versioned by that module rather than
+        // by openmrs-core. The core version still matters for interpreting the schemas (resources
+        // are version-gated via supportedOpenmrsVersions), so it goes in the description.
         OpenAPI openAPI = new OpenAPI(SpecVersion.V31)
             .info(new Info()
-                .title("OpenMRS REST API")
-                .version(detectOpenmrsVersion())
-                .description("OpenAPI documentation for Person class"));
+                .title(specTitle())
+                .version(moduleVersion != null && !moduleVersion.trim().isEmpty()
+                        ? moduleVersion : "unknown")
+                .description(specDescription()));
 
         ModelConverters converters = ModelConverters.getInstance(true);
 
-        System.out.println("Starting restService...");
-        RestService restService = Context.getService(RestService.class);
-        restService.initialize();
-        List<DelegatingResourceHandler<?>> handlers = restService.getResourceHandlers();
-        Collections.sort(handlers, Comparator.comparing(h -> h.getClass().getSimpleName()));
-        System.out.println("Starting restService... done");
-
-        converters.addConverter(new CustomModelResolver(Json31.mapper()));
+        converters.addConverter(new OpenMRSResourceModelResolver(Json31.mapper()));
 
         Components components = new Components();
 
@@ -216,12 +114,17 @@ public class OpenApiSpecGenerator {
 
         com.fasterxml.jackson.databind.ObjectMapper swaggerMapper = io.swagger.v3.core.util.Json.mapper();
 
+        // Two owned handlers can resolve to the same resource name, in which case the second
+        // overwrites the first file. Track them so the count reported to the user reconciles
+        // with the number of files on disk.
+        java.util.Map<String, String> writtenBy = new java.util.LinkedHashMap<String, String>();
+
         for (DelegatingResourceHandler<?> handler : handlers) {
-            String resourceName = CustomModelResolver.getResourceName(handler);
+            String resourceName = OpenMRSResourceModelResolver.getResourceName(handler);
 
             // Always resolve schemas — the ModelConverterContext needs every handler processed so
             // that cross-module $ref targets (e.g. Patient, Visit) can be named correctly.
-            ResolvedSchema resolvedSchema = converters.resolveAsResolvedSchema(new OpenmrsResourceAnnotatedType(handler.getClass(), handler));
+            ResolvedSchema resolvedSchema = converters.resolveAsResolvedSchema(new OpenmrsResourceAnnotatedType(handler));
 
             // Only write files and openapi.json entries for resources defined in this module.
             // Handlers from dependency JARs (REST core, openmrs-api, etc.) are skipped.
@@ -229,6 +132,12 @@ public class OpenApiSpecGenerator {
                 continue;
             }
 
+            String previousOwner = writtenBy.put(resourceName, handler.getClass().getName());
+            if (previousOwner != null) {
+                System.out.println("WARN  resource name '" + resourceName + "' claimed by both "
+                        + previousOwner + " and " + handler.getClass().getName()
+                        + "; the later one wins and only one file is written");
+            }
             log.info("generating " + resourceName);
 
             // Collect schemas for this resource
@@ -236,7 +145,7 @@ public class OpenApiSpecGenerator {
             resourceComponents.addSchemas(resourceName, resolvedSchema.schema);
             if (resolvedSchema.referencedSchemas != null) {
                 // Only include schemas belonging to this resource (e.g. VisitGet_default, VisitCreate).
-                // CustomModelResolver may register orphaned schemas in the context as a side effect of
+                // OpenMRSResourceModelResolver may register orphaned schemas in the context as a side effect of
                 // calling super.resolve() on complex non-OpenmrsObject types (e.g. CodedOrFreeText,
                 // Allergen). Those schemas are redundant here because cross-resource references are
                 // expressed as $ref pointers to the owning resource's own JSON file, not inline copies.
@@ -290,12 +199,12 @@ public class OpenApiSpecGenerator {
         openAPI.components(components);
 
         // Document concrete @Controller beans (all except MainResourceController / MainSubResourceController)
-        if (ctx != null) {
+        if (controllerClasses != null && !controllerClasses.isEmpty()) {
             try {
                 Path controllersDir = Paths.get(outputDir, "controllers");
                 Files.createDirectories(controllersDir);
                 io.swagger.v3.oas.models.Paths controllerPaths =
-                    new ControllerDocumenter().document(ctx, controllersDir, components,
+                    new ControllerDocumenter().document(controllerClasses, controllersDir, components,
                         ownedLocations != null ? String.join(";", ownedLocations) : "");
                 if (!controllerPaths.isEmpty()) {
                     if (openAPI.getPaths() == null) {
@@ -321,14 +230,16 @@ public class OpenApiSpecGenerator {
             // openapi.json is self-describing with uniform "#/components/schemas/" pointers.
             //
             // Two forms to fix:
-            //   "#/schemas/Foo"           (intra-file refs from CustomModelResolver)
-            //   "./Location.json#/schemas/Foo"  (cross-module refs from CustomModelResolver)
+            //   "#/schemas/Foo"           (intra-file refs from OpenMRSResourceModelResolver)
+            //   "./Location.json#/schemas/Foo"  (cross-module refs from OpenMRSResourceModelResolver)
             // Both become "#/components/schemas/Foo".
             json = json.replace("\"#/schemas/", "\"#/components/schemas/");
             json = json.replaceAll("\"\\./" + "[A-Za-z0-9_.\\-]+" + "\\.json#/schemas/",
                 "\"#/components/schemas/");
             Files.write(openApiOut, json.getBytes(java.nio.charset.StandardCharsets.UTF_8));
             System.out.println("Wrote OpenAPI file: " + openApiOut.toAbsolutePath());
+            System.out.println("Documented " + writtenBy.size() + " resources from this module.");
+            reportStubbedServices();
         } catch (Exception e) {
             throw new RuntimeException("Unable to write OpenAPI output: " + openApiOut, e);
         }
@@ -340,7 +251,7 @@ public class OpenApiSpecGenerator {
      * corresponds to specific HTTP routes.
      */
     private static void addPathsForHandler(DelegatingResourceHandler<?> handler, String resourceName, io.swagger.v3.oas.models.Paths paths) {
-        String restPath = CustomModelResolver.getResourceRestPath(handler);
+        String restPath = OpenMRSResourceModelResolver.getResourceRestPath(handler);
         String schemaRef = "#/components/schemas/";
 
         // ---- Collection path (no UUID): GET list/search, POST create/upload ----
@@ -465,53 +376,53 @@ public class OpenApiSpecGenerator {
             .schema(new Schema<>().type("string")._default("default"));
     }
 
-    private static void loadDataSet(Connection conn, String path) throws Exception {
-        InputStream is = Thread.currentThread().getContextClassLoader().getResourceAsStream(path);
-        if (is == null) {
-            throw new RuntimeException("Dataset resource not found on classpath: " + path);
-        }
-        IDatabaseConnection dbConn = new DatabaseConnection(conn, "PUBLIC");
-        DatabaseConfig config = dbConn.getConfig();
-        config.setProperty(DatabaseConfig.PROPERTY_DATATYPE_FACTORY, new H2DataTypeFactory());
-        IDataSet dataset = new FlatXmlDataSetBuilder().setColumnSensing(true).build(is);
-        DatabaseOperation.REFRESH.execute(dbConn, dataset);
+    /**
+     * Returns true if the handler's class was loaded from this module's own compiled output
+     * (target/classes) or a sibling artifact of the same Maven project, false if it came from a
+     * dependency JAR. Falls back to true when no owned locations were supplied.
+     */
+    private boolean isModuleOwnedHandler(DelegatingResourceHandler<?> handler) {
+        return ModuleOwnership.isOwned(handler.getClass(), ownedLocations);
     }
 
     /**
-     * Returns true if the handler's class was loaded from this module's own compiled output
-     * (target/classes), false if it came from a dependency JAR.
-     * Falls back to true when moduleClassesDir is not set (generates everything).
+     * Prints every service call that a stub answered. A stub returning a default can change a
+     * schema without failing, so the calls are surfaced rather than left silent.
      */
-    private boolean isModuleOwnedHandler(DelegatingResourceHandler<?> handler) {
-        if (ownedLocations == null || ownedLocations.isEmpty()) {
-            return true;
+    private static void reportStubbedServices() {
+        java.util.Set<String> stubbed = StubRuntime.getStubbedServices();
+        if (stubbed.isEmpty()) {
+            System.out.println("No stubbed service calls were needed.");
+            return;
         }
-        try {
-            java.security.CodeSource cs = handler.getClass().getProtectionDomain().getCodeSource();
-            if (cs == null || cs.getLocation() == null) {
-                return false;
-            }
-            java.io.File handlerLocation = new java.io.File(cs.getLocation().toURI()).getCanonicalFile();
-            for (String owned : ownedLocations) {
-                if (handlerLocation.equals(new java.io.File(owned).getCanonicalFile())) {
-                    return true;
-                }
-            }
-            return false;
-        } catch (Exception e) {
-            log.warn("Could not determine code source for {}: {}", handler.getClass().getName(), e.getMessage());
-            return false;
+        System.out.println("Stubbed service calls (" + stubbed.size()
+                + ") — these returned defaults and may affect the schemas above:");
+        for (String call : stubbed) {
+            System.out.println("  " + call);
         }
     }
 
-    private String detectOpenmrsVersion() {
-        try {
-            String version = Context.getAdministrationService().getGlobalProperty("openmrs.version");
-            if (version != null && !version.isEmpty()) {
-                return version;
-            }
-        } catch (IllegalArgumentException | SecurityException ignored) {}
+    /** The module being documented, e.g. "Queue OMOD". */
+    private String specTitle() {
+        return (moduleName != null && !moduleName.trim().isEmpty())
+                ? moduleName.trim() : "OpenMRS REST API";
+    }
 
-        return "unknown";
+    /**
+     * The core version belongs here because resources are version-gated via
+     * supportedOpenmrsVersions, so the same module yields different schemas on different cores.
+     */
+    private String specDescription() {
+        return "OpenAPI documentation for the REST resources and controllers of " + specTitle()
+                + ". Generated against openmrs-core " + detectOpenmrsVersion() + ".";
+    }
+
+    /**
+     * Reads the core version from openmrs-api's manifest rather than the (unavailable) database
+     * global property. HandlerScanner already fails fast if this is blank.
+     */
+    private String detectOpenmrsVersion() {
+        String version = org.openmrs.util.OpenmrsConstants.OPENMRS_VERSION_SHORT;
+        return (version != null && !version.trim().isEmpty()) ? version : "unknown";
     }
 }
