@@ -222,6 +222,32 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
         return Schemas.of("string").description("Fully qualified Java class name");
       }
 
+      // Same problem, other libraries. A property whose type belongs to a third-party API gets
+      // bean-introspected into that API's object graph, which then appears in the spec as though
+      // it were part of the REST API:
+      //
+      //   Module.config / Module.sqldiff  hold config.xml and sqldiff.xml as parsed DOM
+      //                                   documents, and dragged in eleven org.w3c.dom schemas
+      //                                   (Node, NodeList, NamedNodeMap, TypeInfo, Attr, ...) —
+      //                                   most of Module.json
+      //   ServerLog.memoryAppender        is a log4j Appender, and dragged in Filter, Property,
+      //                                   LayoutSerializable and ErrorHandler along with the
+      //                                   appender's own lifecycle flags
+      //
+      // None of it has a meaningful JSON shape, so say the type is undocumented rather than
+      // describe someone else's API.
+      if (type.getType() != null) {
+        Class<?> rawClass = TypeFactory.rawClass(type.getType());
+        String library = foreignApiLabel(rawClass);
+        if (library != null) {
+          Schema<?> schema = Schemas.object();
+          schema.setDescription("A " + rawClass.getSimpleName() + " (" + library
+              + "); not part of the REST API, shape unspecified");
+          schema.addExtension("x-openmrs-undocumented-type", rawClass.getName());
+          return schema;
+        }
+      }
+
       return super.resolve(type, context, chain);
   }
 
@@ -1110,6 +1136,47 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
           return className.substring(0, matcher.start());
       }
       return className;
+  }
+
+  /**
+   * Third-party APIs that must never be bean-introspected into the spec, mapped to the name used
+   * to describe them. A type is matched by its own package or by any it inherits from, so an
+   * OpenMRS subclass of a foreign base — {@code MemoryAppender extends AbstractAppender} — is
+   * caught too.
+   */
+  private static final Map<String, String> FOREIGN_API_PACKAGES = new LinkedHashMap<String, String>() {
+    {
+      put("org.w3c.dom.", "W3C DOM");
+      put("org.apache.logging.log4j.", "log4j");
+      put("org.apache.log4j.", "log4j");
+    }
+  };
+
+  /** The library a class belongs to if it is a foreign API type, else null. */
+  private static String foreignApiLabel(Class<?> rawClass) {
+    for (Class<?> current = rawClass; current != null && !Object.class.equals(current);
+        current = current.getSuperclass()) {
+      String label = packageLabel(current);
+      if (label != null) {
+        return label;
+      }
+      for (Class<?> implemented : current.getInterfaces()) {
+        label = packageLabel(implemented);
+        if (label != null) {
+          return label;
+        }
+      }
+    }
+    return null;
+  }
+
+  private static String packageLabel(Class<?> cls) {
+    for (Map.Entry<String, String> entry : FOREIGN_API_PACKAGES.entrySet()) {
+      if (cls.getName().startsWith(entry.getKey())) {
+        return entry.getValue();
+      }
+    }
+    return null;
   }
 
   /**
