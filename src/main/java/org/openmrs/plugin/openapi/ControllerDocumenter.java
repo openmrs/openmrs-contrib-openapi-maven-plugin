@@ -126,8 +126,20 @@ public class ControllerDocumenter {
                         io.swagger.v3.core.converter.ModelConverterContext context,
                         java.util.Iterator<io.swagger.v3.core.converter.ModelConverter> chain) {
                     Class<?> raw = com.fasterxml.jackson.databind.type.TypeFactory.rawClass(type.getType());
-                    if (raw != null && resourceSchemas.containsKey(raw.getSimpleName())) {
-                        return Schemas.ref("#/components/schemas/" + raw.getSimpleName());
+                    if (raw != null) {
+                        // Prefer the REF representation over the bare resource name. The bare name
+                        // holds the resource's anyOf over [Get, Create, Update], so a controller
+                        // POJO field typed VisitType was documented as "a visit type in any of its
+                        // read and write shapes" — including two request-body shapes a response
+                        // field can never hold. REF is what the API actually returns for a nested
+                        // resource, and it is what the resource path emits for the same field.
+                        String ref = raw.getSimpleName() + "Get_ref";
+                        if (resourceSchemas.containsKey(ref)) {
+                            return Schemas.ref("#/components/schemas/" + ref);
+                        }
+                        if (resourceSchemas.containsKey(raw.getSimpleName())) {
+                            return Schemas.ref("#/components/schemas/" + raw.getSimpleName());
+                        }
                     }
                     return chain.hasNext() ? chain.next().resolve(type, context, chain) : null;
                 }

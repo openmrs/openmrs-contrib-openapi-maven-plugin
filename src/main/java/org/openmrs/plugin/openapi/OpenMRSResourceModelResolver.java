@@ -248,6 +248,52 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
         }
       }
 
+      // A property whose declared type is an OpenmrsObject that a REST resource documents is a
+      // reference to that resource — not a bean-introspected copy of the domain class.
+      //
+      // Every other path already knows this: the representation path short-circuits
+      // OpenmrsObject properties to getRefSchemaForResource(), and so do the custom-representation
+      // path and the @Schema-annotation path. What was missing was the fall-through. Once
+      // super.resolve() bean-introspects any type, Swagger walks its properties and re-enters this
+      // method for each one, and an OpenmrsObject-typed property landed here with nothing to catch
+      // it — so it was documented twice, once as the resource's representation schemas and once as
+      // a bean schema named after the domain class.
+      //
+      // Two things went wrong as a result:
+      //
+      //   Correctness. Both live in one flat components/schemas namespace keyed by simple name, so
+      //   whichever was written last won. For User, Privilege, Module, TaskDefinition and VisitType
+      //   the resource's anyOf-over-representations won, and Concept.creator — a read-only audit
+      //   field — resolved to anyOf[UserGet, UserCreate, UserUpdate], a union including two write
+      //   payload shapes. For Concept, ConceptName, Drug and 12 more the bean schema won, and the
+      //   resource's own union was displaced by a copy of the domain class.
+      //
+      //   Size. The domain classes are mutually recursive (Concept <-> ConceptName <->
+      //   ConceptDescription <-> Drug <-> ConceptAttribute), so bean introspection multiplied:
+      //   one $ref to the bean Concept expanded to 18,228 nodes against 4 for ConceptGet_ref, and
+      //   the whole document expanded to 975,834 nodes against 52,540 once this branch exists.
+      //
+      // REF is the representation, matching every other nested-resource site — it is what
+      // ConversionUtil.convertToRepresentation() returns for an OpenmrsObject with no sub-rep.
+      //
+      // The test is "a resource documents this class", not "this class is an OpenmrsObject".
+      // Those are not the same set: ModuleResource1_8's supported class is
+      // org.openmrs.module.Module, a module descriptor that implements no OpenmrsObject interface,
+      // and ModuleAction.modules[].advicePoints[] was still bean-introspecting it. Asking the
+      // resource registry directly also means the lookup handles the cases where the class and its
+      // resource are named differently (Allergy -> PatientAllergyResource2_0,
+      // GlobalProperty -> SystemSettingResource1_9) for free, since getResourceSpecFilename()
+      // already mirrors RestServiceImpl.getResourceBySupportedClass().
+      //
+      // A null return means no resource documents the class, and those types must keep falling
+      // through to bean introspection rather than become unresolvedTypeSchema() — 16 schemas in
+      // webservices.rest depend on that. SimpleObject, java.lang.Class and foreign-API types are
+      // already handled above, so they never reach here.
+      if (type.getType() != null
+              && getResourceSpecFilename(type.getType(), Representation.REF) != null) {
+        return getRefSchemaForResource(type.getType(), Representation.REF);
+      }
+
       return super.resolve(type, context, chain);
   }
 
