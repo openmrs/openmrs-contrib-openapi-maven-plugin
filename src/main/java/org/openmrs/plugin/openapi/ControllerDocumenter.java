@@ -55,6 +55,9 @@ import java.util.Set;
  */
 public class ControllerDocumenter {
 
+    /** Name given to the path variable standing in for a `**` version wildcard. */
+    private static final String VERSION_VARIABLE = "version";
+
     private static final Logger log = LoggerFactory.getLogger(ControllerDocumenter.class);
 
     private static final Set<String> EXCLUDED_CONTROLLERS = new HashSet<>(Arrays.asList(
@@ -71,7 +74,7 @@ public class ControllerDocumenter {
     public Paths document(List<Class<?>> controllerClasses, Path controllersDir, Components mainComponents,
             String ownedLocationsSemicolon) throws IOException {
         Paths allPaths = new Paths();
-        com.fasterxml.jackson.databind.ObjectMapper mapper = io.swagger.v3.core.util.Json.mapper();
+        com.fasterxml.jackson.databind.ObjectMapper mapper = io.swagger.v3.core.util.Json31.mapper();
 
         // Capture the resource $ref placeholders so resolveType() can check them before
         // falling through to Jackson bean introspection.
@@ -109,7 +112,14 @@ public class ControllerDocumenter {
             // The resource-ref converter runs first: any type already registered as a REST
             // resource gets a $ref instead of full bean introspection, which prevents Jackson
             // from ever recursing into their transitive dependencies.
+            // ModelConverters' own default resolver uses Json.mapper() — the 3.0 mapper, with
+            // Jackson's unsorted bean introspection — so controller schemas built from POJOs
+            // reordered between runs (emrapi's DiagnosisController moved ConceptDatatype's
+            // time/date/boolean properties every time). addConverter inserts at the head of the
+            // chain, so this one wins.
             ModelConverters converters = new ModelConverters();
+            converters.addConverter(new io.swagger.v3.core.jackson.ModelResolver(
+                OpenMRSResourceModelResolver.withStablePropertyOrder(io.swagger.v3.core.util.Json31.mapper())));
             converters.addConverter(new io.swagger.v3.core.converter.ModelConverter() {
                 @Override
                 public Schema<?> resolve(AnnotatedType type,
@@ -117,7 +127,7 @@ public class ControllerDocumenter {
                         java.util.Iterator<io.swagger.v3.core.converter.ModelConverter> chain) {
                     Class<?> raw = com.fasterxml.jackson.databind.type.TypeFactory.rawClass(type.getType());
                     if (raw != null && resourceSchemas.containsKey(raw.getSimpleName())) {
-                        return new Schema<>().$ref("#/components/schemas/" + raw.getSimpleName());
+                        return Schemas.ref("#/components/schemas/" + raw.getSimpleName());
                     }
                     return chain.hasNext() ? chain.next().resolve(type, context, chain) : null;
                 }
@@ -230,6 +240,12 @@ public class ControllerDocumenter {
 
         String fullPath = normalizeRestPath(joinPath(basePath, subPath));
         Operation op = buildOperation(method, schemas, converters);
+        if (fullPath.contains("{" + VERSION_VARIABLE + "}")) {
+            // No controller method declares a @PathVariable for it — the segment comes from the
+            // wildcard in the mapping, not from the signature — but an OpenAPI path template
+            // variable must still be declared or the document is invalid.
+            op.addParametersItem(versionParam());
+        }
 
         PathItem pathItem = paths.get(fullPath);
         if (pathItem == null) {
@@ -313,15 +329,15 @@ public class ControllerDocumenter {
 
         if (type instanceof Class) {
             Class<?> cls = (Class<?>) type;
-            if (cls == String.class) return new Schema<String>().type("string");
-            if (cls == byte[].class) return new Schema<>().type("string").format("binary");
-            if (cls == boolean.class || cls == Boolean.class) return new Schema<Boolean>().type("boolean");
+            if (cls == String.class) return Schemas.<String>of("string");
+            if (cls == byte[].class) return Schemas.of("string").format("binary");
+            if (cls == boolean.class || cls == Boolean.class) return Schemas.<Boolean>of("boolean");
             if (Number.class.isAssignableFrom(cls) || (cls.isPrimitive() && cls != boolean.class))
-                return new Schema<>().type("number");
-            if (cls == Object.class) return new ObjectSchema();
-            if (Map.class.isAssignableFrom(cls)) return new ObjectSchema();
+                return Schemas.of("number");
+            if (cls == Object.class) return Schemas.object();
+            if (Map.class.isAssignableFrom(cls)) return Schemas.object();
             // MultipartFile — check by name to avoid hard dependency on servlet API version
-            if ("MultipartFile".equals(cls.getSimpleName())) return new Schema<>().type("string").format("binary");
+            if ("MultipartFile".equals(cls.getSimpleName())) return Schemas.of("string").format("binary");
         }
 
         if (type instanceof ParameterizedType) {
@@ -330,15 +346,15 @@ public class ControllerDocumenter {
             if (List.class.isAssignableFrom(raw) || Iterable.class.isAssignableFrom(raw)) {
                 Type itemType = pt.getActualTypeArguments()[0];
                 Schema<?> items = resolveType(itemType, schemas, converters);
-                return new ArraySchema().items(items != null ? items : new ObjectSchema());
+                return Schemas.array().items(items != null ? items : Schemas.object());
             }
-            if (Map.class.isAssignableFrom(raw)) return new ObjectSchema();
+            if (Map.class.isAssignableFrom(raw)) return Schemas.object();
         }
 
         // POJO: use ModelConverters (Jackson-based introspection)
         try {
             ResolvedSchema resolved = converters.resolveAsResolvedSchema(new AnnotatedType(type));
-            if (resolved == null) return new ObjectSchema();
+            if (resolved == null) return Schemas.object();
             if (resolved.referencedSchemas != null) {
                 for (Map.Entry<?, ?> e : resolved.referencedSchemas.entrySet()) {
                     String name = (String) e.getKey();
@@ -357,16 +373,28 @@ public class ControllerDocumenter {
             Class<?> rawType = com.fasterxml.jackson.databind.type.TypeFactory.rawClass(type);
             if (rawType != null && resolved.referencedSchemas != null
                     && resolved.referencedSchemas.containsKey(rawType.getSimpleName())) {
-                return new Schema<>().$ref("#/components/schemas/" + rawType.getSimpleName());
+                return Schemas.ref("#/components/schemas/" + rawType.getSimpleName());
             }
-            return resolved.schema != null ? resolved.schema : new ObjectSchema();
+            return resolved.schema != null ? resolved.schema : Schemas.object();
         } catch (Exception e) {
             log.debug("Could not resolve schema for {}: {}", type, e.getMessage());
-            return new ObjectSchema();
+            return Schemas.object();
         }
     }
 
     // ---- static helpers ----
+
+    /**
+     * The REST API version segment a controller matches with {@code **}. Only {@code v1} exists
+     * today, so it is documented as the default rather than as a free string.
+     */
+    private static Parameter versionParam() {
+        Schema<String> schema = Schemas.<String> of("string")._default("v1");
+        schema.addEnumItemObject("v1");
+        return new Parameter().name(VERSION_VARIABLE).in("path").required(true)
+            .description("REST API version segment; the controller matches any value, only v1 is in use")
+            .schema(schema);
+    }
 
     private static String classBasePath(Class<?> cls) {
         RequestMapping rm = cls.getAnnotation(RequestMapping.class);
@@ -379,16 +407,35 @@ public class ControllerDocumenter {
         return ModuleOwnership.isOwned(cls, ownedLocations);
     }
 
-    // Strips the /rest/**/ wildcard prefix used by OpenMRS REST controllers, then
-    // prepends /ws so the final path matches the actual servlet mount point.
-    // e.g. "/rest/**/emrapi/foo" -> "/ws/emrapi/foo"
-    //      "/rest/v1/visitconfiguration" -> "/ws/rest/v1/visitconfiguration"
+    /**
+     * Maps a controller's Spring mapping onto the URL a client actually calls: OpenMRS mounts the
+     * REST servlet at {@code /ws}, so {@code "/rest/v1/visitconfiguration"} is served at
+     * {@code "/ws/rest/v1/visitconfiguration"}.
+     * <p>
+     * A controller that means to serve every REST version writes the version segment as Spring's
+     * {@code **} wildcard — {@code "/rest/&#42;&#42;/emrapi/doseFormGroups"} in
+     * {@code openmrs-module-emrapi}. That is modelled as a path variable, giving
+     * {@code "/ws/rest/{version}/emrapi/doseFormGroups"}. In practice the only value that reaches
+     * these controllers is {@code v1}, but a variable keeps the documented path a real callable URL
+     * and keeps the wildcard out of the spec — an OpenAPI path template cannot contain {@code *}.
+     * <p>
+     * This used to drop the wildcard segment along with everything before it, which silently ate
+     * {@code /rest} too and produced {@code "/ws/emrapi/doseFormGroups"} — a path that does not
+     * exist.
+     */
     private static String normalizeRestPath(String path) {
-        int wildcardIdx = path.indexOf("**/");
-        if (wildcardIdx >= 0) {
-            return "/ws/" + path.substring(wildcardIdx + 3);
+        String normalized = path.startsWith("/") ? path : "/" + path;
+        normalized = normalized.replace("/**/", "/{" + VERSION_VARIABLE + "}/");
+        if (normalized.endsWith("/**")) {
+            normalized = normalized.substring(0, normalized.length() - 3) + "/{" + VERSION_VARIABLE + "}";
         }
-        return "/ws" + path;
+        // Only the REST servlet lives under /ws. A controller mapped "module/emrapi/foo.form" is an
+        // ordinary module page served from the application root, and prefixing it produced
+        // "/ws/module/emrapi/foo.form" — a URL that does not exist. Across the verified modules
+        // every class-level mapping starts with either "rest" or "module", so the first segment is
+        // a reliable discriminator.
+        return normalized.startsWith("/rest/") || normalized.equals("/rest")
+            ? "/ws" + normalized : normalized;
     }
 
     private static String joinPath(String base, String sub) {
@@ -411,15 +458,15 @@ public class ControllerDocumenter {
 
     private static Schema<?> scalarSchema(Class<?> type) {
         if (type == int.class || type == Integer.class)
-            return new Schema<Integer>().type("integer").format("int32");
+            return Schemas.<Integer>of("integer").format("int32");
         if (type == long.class || type == Long.class)
-            return new Schema<Long>().type("integer").format("int64");
+            return Schemas.<Long>of("integer").format("int64");
         if (type == boolean.class || type == Boolean.class)
-            return new Schema<Boolean>().type("boolean");
+            return Schemas.<Boolean>of("boolean");
         if (type == double.class || type == Double.class
                 || type == float.class || type == Float.class)
-            return new Schema<Double>().type("number");
-        return new Schema<String>().type("string");
+            return Schemas.<Double>of("number");
+        return Schemas.<String>of("string");
     }
 
     private static boolean isVoidType(Type type) {

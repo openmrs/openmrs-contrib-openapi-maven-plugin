@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.openmrs.module.ModuleUtil;
+import org.openmrs.module.webservices.rest.util.ReflectionUtil;
 import org.openmrs.module.webservices.rest.web.annotation.SubClassHandler;
 import org.openmrs.module.webservices.rest.web.annotation.SubResource;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
@@ -121,12 +122,76 @@ public class HandlerScanner {
                 handlers.add((DelegatingResourceHandler<?>) definition.instance);
             }
         }
-        for (DelegatingSubclassHandler<?, ?> subclassHandler : findSubclassHandlers()) {
-            handlers.add((DelegatingResourceHandler<?>) subclassHandler);
-        }
-
         reportCounts("resource handlers", toClasses(handlers), handlers.size());
         return handlers;
+    }
+
+    /**
+     * Binds each discovered subclass handler to the resource it extends, mirroring
+     * {@code BaseDelegatingResource.init()}: the handler's {@code Superclass} type parameter names
+     * a domain class, and the handler attaches to the resource whose {@code supportedClass} is that
+     * class.
+     * <p>
+     * Subclass handlers are not resources — they have no REST name and no routes. They add a type
+     * to their parent (e.g. {@code drugorder} on {@code v1/order}), so they are returned keyed by
+     * parent rather than mixed into the resource list.
+     *
+     * @param resources the resources returned by {@link #findResourceHandlers()}
+     * @return parent resource handler -> its subclass handlers, sorted by type name
+     */
+    public Map<DelegatingResourceHandler<?>, List<DelegatingSubclassHandler<?, ?>>> findSubclassHandlersByResource(
+            List<DelegatingResourceHandler<?>> resources) throws IOException {
+        Map<Class<?>, DelegatingResourceHandler<?>> bySupportedClass =
+                new LinkedHashMap<Class<?>, DelegatingResourceHandler<?>>();
+        for (DelegatingResourceHandler<?> resource : resources) {
+            org.openmrs.module.webservices.rest.web.annotation.Resource annotation = resource.getClass()
+                    .getAnnotation(org.openmrs.module.webservices.rest.web.annotation.Resource.class);
+            if (annotation != null && !bySupportedClass.containsKey(annotation.supportedClass())) {
+                bySupportedClass.put(annotation.supportedClass(), resource);
+            }
+        }
+
+        Map<DelegatingResourceHandler<?>, List<DelegatingSubclassHandler<?, ?>>> bound =
+                new LinkedHashMap<DelegatingResourceHandler<?>, List<DelegatingSubclassHandler<?, ?>>>();
+        int unbound = 0;
+        for (DelegatingSubclassHandler<?, ?> handler : findSubclassHandlers()) {
+            Class<?> superclass = ReflectionUtil.getParameterizedTypeFromInterface(handler.getClass(),
+                    DelegatingSubclassHandler.class, 0);
+            DelegatingResourceHandler<?> parent = superclass == null ? null : bySupportedClass.get(superclass);
+            if (parent == null) {
+                // init() would throw for a null superclass and simply never attach the handler when
+                // no resource supports it; either way it contributes nothing a client can reach.
+                System.out.println("WARN  subclass handler " + handler.getClass().getName()
+                        + " has no resource for superclass " + superclass + "; not documented");
+                unbound++;
+                continue;
+            }
+            List<DelegatingSubclassHandler<?, ?>> forParent = bound.get(parent);
+            if (forParent == null) {
+                forParent = new ArrayList<DelegatingSubclassHandler<?, ?>>();
+                bound.put(parent, forParent);
+            }
+            forParent.add(handler);
+        }
+
+        int total = 0;
+        for (List<DelegatingSubclassHandler<?, ?>> forParent : bound.values()) {
+            java.util.Collections.sort(forParent, java.util.Comparator.comparing(h -> typeNameOf(h)));
+            total += forParent.size();
+        }
+        System.out.println("Bound " + total + " subclass handler(s) to " + bound.size() + " resource(s)"
+                + (unbound > 0 ? " (" + unbound + " unbound)" : ""));
+        return bound;
+    }
+
+    /** {@code getTypeName()} can throw for a handler that never expected to run outside a request. */
+    private static String typeNameOf(DelegatingSubclassHandler<?, ?> handler) {
+        try {
+            String name = handler.getTypeName();
+            return name != null ? name : handler.getClass().getSimpleName();
+        } catch (RuntimeException e) {
+            return handler.getClass().getSimpleName();
+        }
     }
 
     /**
@@ -145,17 +210,30 @@ public class HandlerScanner {
     /**
      * Subclass handlers are Spring components at runtime
      * ({@code Context.getRegisteredComponents(DelegatingSubclassHandler.class)}). Scanning for
-     * concrete implementations carrying a version-compatible {@code @SubClassHandler} is the
-     * reflection equivalent, and applies the same version filter as
-     * {@code BaseDelegatingResource.init()}.
+     * concrete implementations carrying a {@code @SubClassHandler} is the reflection equivalent,
+     * and the {@code supportedOpenmrsVersions} filter mirrors {@code BaseDelegatingResource.init()}
+     * — the step that actually binds a handler to its resource.
      */
     private List<DelegatingSubclassHandler<?, ?>> findSubclassHandlers() throws IOException {
         List<DelegatingSubclassHandler<?, ?>> handlers = new ArrayList<DelegatingSubclassHandler<?, ?>>();
         for (Class<?> cls : scan(new AssignableTypeFilter(DelegatingSubclassHandler.class))) {
-            // Deliberately no version filter: RestServiceImpl.getResourceHandlers() appends every
-            // registered DelegatingSubclassHandler unfiltered (the version check in
-            // BaseDelegatingResource.init() applies when binding handlers to a resource, not here).
-            if (cls.getAnnotation(SubClassHandler.class) == null) {
+            SubClassHandler annotation = cls.getAnnotation(SubClassHandler.class);
+            if (annotation == null) {
+                continue;
+            }
+            // Version-filtered, matching BaseDelegatingResource.init(), which is what decides
+            // whether a handler is ever bound to its resource — and therefore whether clients can
+            // see its type at all. RestServiceImpl.getResourceHandlers() appends every registered
+            // handler unfiltered, but that list is not the API surface.
+            //
+            // It matters because the version variants of one handler all report the same
+            // getTypeName(). DrugOrderSubclassHandler1_8, _1_10 and _1_12 are all "drugorder";
+            // unfiltered, the spec published three competing shapes for one type value, two of
+            // which never load.
+            if (!versionMatches(annotation.supportedOpenmrsVersions())) {
+                log.debug("Skipping subclass handler {}: supportedOpenmrsVersions {} does not match core {}",
+                        cls.getName(), java.util.Arrays.toString(annotation.supportedOpenmrsVersions()),
+                        OpenmrsConstants.OPENMRS_VERSION_SHORT);
                 continue;
             }
             Object instance = instantiate(cls);

@@ -43,6 +43,7 @@ import org.openmrs.module.webservices.rest.web.resource.api.Updatable;
 import org.openmrs.module.webservices.rest.web.resource.api.Uploadable;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceDescription;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
+import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingSubclassHandler;
 import org.openmrs.module.webservices.rest.web.response.ResourceDoesNotSupportOperationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -56,6 +57,7 @@ import io.swagger.v3.core.converter.ModelConverter;
 import io.swagger.v3.core.converter.ModelConverterContext;
 import io.swagger.v3.core.jackson.ModelResolver;
 import io.swagger.v3.oas.models.media.ArraySchema;
+import io.swagger.v3.oas.models.media.Discriminator;
 import io.swagger.v3.oas.models.media.ObjectSchema;
 import io.swagger.v3.oas.models.media.Schema;
 
@@ -64,6 +66,18 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
   private static final Logger log = LoggerFactory.getLogger(OpenMRSResourceModelResolver.class);
 
   public static final Representation[] STANDARD_REPRESENTATIONS = {Representation.DEFAULT, Representation.FULL, Representation.REF};
+
+  /** Domain class -> the name of the resource documenting it. @see #registerResourceNames */
+  private static final Map<Class<?>, String> RESOURCE_NAME_BY_SUPPORTED_CLASS = new LinkedHashMap<>();
+
+  /** Subclass-handled domain class -> its parent resource name, and -> its subtype name. */
+  private static final Map<Class<?>, String> PARENT_BY_SUBCLASS = new LinkedHashMap<>();
+
+  private static final Map<Class<?>, String> VARIANT_BY_SUBCLASS = new LinkedHashMap<>();
+
+  /** {@code RestConstants.PROPERTY_FOR_TYPE} — the subtype discriminator stamped on responses. */
+  private static final String TYPE_PROPERTY =
+      org.openmrs.module.webservices.rest.web.RestConstants.PROPERTY_FOR_TYPE;
 
   /** Trailing "Resource", optionally followed by a version suffix such as "1_8" or "2_0". */
   private static final Pattern RESOURCE_SUFFIX = Pattern.compile("Resource(\\d+(_\\d+)*)?$");
@@ -98,7 +112,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
    * The mapper is copied rather than reconfigured: {@code Json31.mapper()} is a shared singleton
    * in swagger-core and is also used to serialise the output.
    */
-  private static ObjectMapper withStablePropertyOrder(ObjectMapper mapper) {
+  static ObjectMapper withStablePropertyOrder(ObjectMapper mapper) {
     ObjectMapper copy = mapper.copy();
     copy.setConfig(copy.getSerializationConfig().with(MapperFeature.SORT_PROPERTIES_ALPHABETICALLY));
     return copy;
@@ -112,7 +126,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
 
         List<Schema<?>> getSchemas = new ArrayList<>();
         List<Schema<?>> writeSchemas = new ArrayList<>();
-        for (Schema<?> s : resolveRepresentationSchemasForResource(omrsType, context, chain)) {
+        for (Schema<?> s : resolveSchemasWithSubtypes(omrsType, context, chain)) {
           if (s.getName() != null && s.getName().contains("Get_")) {
             getSchemas.add(s);
           } else {
@@ -121,7 +135,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
         }
 
         String resourceName = getResourceName(handler);
-        ObjectSchema combinedSchema = new ObjectSchema();
+        ObjectSchema combinedSchema = Schemas.object();
         combinedSchema.setDescription("One of the supported representations for " + resourceName);
 
         List<String> abilities = new ArrayList<>();
@@ -145,7 +159,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
 
         // Build intermediary ResourceGet schema as anyOf of all ResourceGet_* schemas
         if (!getSchemas.isEmpty()) {
-          ObjectSchema getSchema = new ObjectSchema();
+          ObjectSchema getSchema = Schemas.object();
           getSchema.name(resourceName + "Get");
           for (Schema<?> s : getSchemas) {
             context.defineModel(s.getName(), s);
@@ -188,9 +202,24 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
             return resolve(new AnnotatedType(typeArg), context, chain);
           }
         }
-        ObjectSchema schema = new ObjectSchema();
+        ObjectSchema schema = Schemas.object();
         schema.additionalProperties(Boolean.TRUE);
         return schema;
+      }
+
+      // A property whose declared type is java.lang.Class must not be bean-introspected. Jackson
+      // treats Class as a POJO and documents the JVM reflection API — module, classLoader,
+      // recordComponents, protectionDomain and friends — as if it were part of the REST API;
+      // OrderType.javaClass alone came out 87KB and 14 levels deep. That graph is also cyclic, so
+      // the point where the walk gets cut off is decided by property iteration order, which makes
+      // the documented subset arbitrary.
+      //
+      // What the API actually returns is the class name: ConversionUtil.convertToRepresentation()
+      // finds no Converter for a Class and falls through to "we have no choice but to return the
+      // plain object", which Jackson serialises as a string —
+      // {"javaClass": "org.openmrs.DrugOrder"}.
+      if (type.getType() != null && Class.class.equals(TypeFactory.rawClass(type.getType()))) {
+        return Schemas.of("string").description("Fully qualified Java class name");
       }
 
       return super.resolve(type, context, chain);
@@ -204,8 +233,170 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
    * @param chain
    * @return
    */
+  /**
+   * Generates a resource's schemas, folding in its subclass handlers when it has a class hierarchy.
+   * <p>
+   * A {@code DelegatingSubclassHandler} is not a resource: it has no REST name and no routes of its
+   * own. {@code BaseDelegatingResource} binds it to a parent resource and dispatches on a
+   * {@code type} discriminator — {@code asRepresentation()} asks
+   * {@code getResourceHandler(delegate)} for the description, then {@code maybeDecorateWithType()}
+   * stamps the response with {@code handler.getTypeName()}. So {@code v1/order} really returns one
+   * of {@code order}, {@code drugorder} or {@code testorder}, and that is what gets documented:
+   * one variant schema per type, unioned under the resource's own schema name.
+   * <p>
+   * {@code oneOf} plus a {@code discriminator} rather than {@code anyOf}, because the subclass
+   * shapes are strict supersets of the base — a {@code drugorder} payload also validates against
+   * the base schema, so a plain union would be true but useless. Pinning {@code type} to a
+   * {@code const} per variant makes exactly one branch match and lets tooling resolve the type
+   * directly.
+   * <p>
+   * {@code Update} is the exception. There {@code type} is optional — {@code DelegatingCrudResource.update()}
+   * only validates it against the existing object when supplied, and rejects a change of type — so
+   * a discriminator cannot be relied on to select a branch and {@code anyOf} is the accurate
+   * statement.
+   */
+  private <T> List<Schema<?>> resolveSchemasWithSubtypes(OpenmrsResourceAnnotatedType<T> type,
+      ModelConverterContext context, Iterator<ModelConverter> chain) {
+    List<DelegatingSubclassHandler<?, ?>> subclassHandlers = type.getSubclassHandlers();
+    if (subclassHandlers.isEmpty()) {
+      return resolveRepresentationSchemasForResource(type, context, chain);
+    }
+
+    DelegatingResourceHandler<T> handler = type.getHandler();
+    String resourceName = getResourceName(handler);
+
+    // kind ("Get_default", "Create", …) -> type name -> that type's schema
+    Map<String, Map<String, Schema<?>>> byKind = new LinkedHashMap<>();
+    collectVariant(byKind, resourceName, getBaseTypeName(handler),
+        resolveRepresentationSchemasForResource(type, context, chain));
+    for (DelegatingSubclassHandler<?, ?> subclassHandler : subclassHandlers) {
+      @SuppressWarnings({ "unchecked", "rawtypes" })
+      OpenmrsResourceAnnotatedType<?> variantType = new OpenmrsResourceAnnotatedType(
+          (DelegatingResourceHandler<?>) subclassHandler, null, resourceName);
+      collectVariant(byKind, resourceName, getSubclassTypeName(subclassHandler),
+          resolveRepresentationSchemasForResource(variantType, context, chain));
+    }
+
+    List<Schema<?>> ret = new ArrayList<>();
+    for (Map.Entry<String, Map<String, Schema<?>>> entry : byKind.entrySet()) {
+      String kind = entry.getKey();
+      Map<String, Schema<?>> variants = entry.getValue();
+      // type is stamped on every response and required on create; on update it may be omitted.
+      boolean typeAlwaysPresent = !"Update".equals(kind);
+
+      for (Map.Entry<String, Schema<?>> variant : variants.entrySet()) {
+        addTypeProperty(variant.getValue(), variant.getKey(), typeAlwaysPresent);
+      }
+
+      if (variants.size() == 1) {
+        // Only one type describes this kind — nothing to union.
+        Schema<?> only = variants.values().iterator().next();
+        only.name(resourceName + kind);
+        ret.add(only);
+        continue;
+      }
+      ret.add(buildTypeUnion(resourceName, kind, variants, typeAlwaysPresent, context));
+    }
+    return ret;
+  }
+
+  /** Files each schema under its kind (the part of the name after the resource name). */
+  private static void collectVariant(Map<String, Map<String, Schema<?>>> byKind, String resourceName,
+      String typeName, List<Schema<?>> schemas) {
+    for (Schema<?> schema : schemas) {
+      String name = schema.getName();
+      if (name == null || !name.startsWith(resourceName)) {
+        continue;
+      }
+      byKind.computeIfAbsent(name.substring(resourceName.length()), k -> new LinkedHashMap<>())
+          .put(typeName, schema);
+    }
+  }
+
+  /**
+   * Defines each variant in the context under {@code <Resource><Kind>_<type>} and returns the union
+   * that carries the resource's own schema name. Variants are defined rather than returned so that
+   * the {@code <Resource>Get} anyOf built by {@link #resolve} lists only the unions.
+   */
+  private static Schema<?> buildTypeUnion(String resourceName, String kind,
+      Map<String, Schema<?>> variants, boolean typeAlwaysPresent, ModelConverterContext context) {
+    ObjectSchema union = Schemas.object();
+    union.name(resourceName + kind);
+    union.setDescription("One of the " + resourceName + " subtypes, selected by '" + TYPE_PROPERTY + "'");
+    Discriminator discriminator = new Discriminator().propertyName(TYPE_PROPERTY);
+
+    for (Map.Entry<String, Schema<?>> entry : variants.entrySet()) {
+      String typeName = entry.getKey();
+      Schema<?> variant = entry.getValue();
+      String variantName = resourceName + kind + "_" + typeName;
+      variant.name(variantName);
+      variant.addExtension("x-openmrs-type", typeName);
+      context.defineModel(variantName, variant);
+
+      String ref = "#/schemas/" + variantName;
+      if (typeAlwaysPresent) {
+        union.addOneOfItem(Schemas.ref(ref));
+        discriminator.mapping(typeName, ref);
+      } else {
+        union.addAnyOfItem(Schemas.ref(ref));
+      }
+    }
+    if (typeAlwaysPresent) {
+      union.setDiscriminator(discriminator);
+    }
+    return union;
+  }
+
+  /** Pins the discriminator to one value on a variant schema. */
+  private static void addTypeProperty(Schema<?> variant, String typeName, boolean required) {
+    if (variant.getProperties() != null && variant.getProperties().containsKey(TYPE_PROPERTY)) {
+      return;
+    }
+    // A single-value enum rather than 3.1's `const`: the spec is written with
+    // io.swagger.v3.core.util.Json's 3.0 mapper, which silently drops `const`. `enum` expresses the
+    // same constraint and survives both writers.
+    Schema<String> typeSchema = Schemas.<String>of("string")
+        .description("Discriminator identifying this subtype");
+    typeSchema.addEnumItemObject(typeName);
+    variant.addProperty(TYPE_PROPERTY, typeSchema);
+    if (required) {
+      variant.addRequiredItem(TYPE_PROPERTY);
+    }
+  }
+
+  /**
+   * The type name of the resource's own class, which {@code BaseDelegatingResource.getTypeName()}
+   * derives from the last segment of the REST name ("v1/order" -> "order").
+   */
+  static String getBaseTypeName(DelegatingResourceHandler<?> handler) {
+    Class<?> cls = handler.getClass();
+    while (cls != null) {
+      org.openmrs.module.webservices.rest.web.annotation.Resource ann =
+          cls.getAnnotation(org.openmrs.module.webservices.rest.web.annotation.Resource.class);
+      if (ann != null && !ann.name().isEmpty()) {
+        return ann.name().substring(ann.name().lastIndexOf('/') + 1);
+      }
+      cls = cls.getSuperclass();
+    }
+    return getResourceName(handler).toLowerCase();
+  }
+
+  /** {@code getTypeName()} can throw for a handler not expecting to run outside a request. */
+  static String getSubclassTypeName(DelegatingSubclassHandler<?, ?> handler) {
+    try {
+      String name = handler.getTypeName();
+      if (name != null && !name.isEmpty()) {
+        return name;
+      }
+    } catch (RuntimeException e) {
+      log.warn("getTypeName() failed for {}", handler.getClass().getName(), e);
+    }
+    return handler.getClass().getSimpleName().toLowerCase();
+  }
+
   public <T> List<Schema<?>> resolveRepresentationSchemasForResource(OpenmrsResourceAnnotatedType<T> type, ModelConverterContext context, Iterator<ModelConverter> chain) {
     DelegatingResourceHandler<T> handler = type.getHandler();
+    String schemaName = type.getSchemaName() != null ? type.getSchemaName() : getResourceName(handler);
     List<Schema<?>> ret = new ArrayList<>();
 
     List<String> generatedReps = new ArrayList<>();
@@ -221,12 +412,12 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
         Schema<?> repResourceSchema = resolveSchemaForResourceDescription(handler, desc, false, context, chain);
         if (repResourceSchema != null) {
           repResourceSchema.addExtension("x-openmrs-representation", rep.getRepresentation());
-          repResourceSchema.name(getResourceName(handler) + "Get_" + rep.getRepresentation());
+          repResourceSchema.name(schemaName + "Get_" + rep.getRepresentation());
           ret.add(repResourceSchema);
           generatedReps.add(rep.getRepresentation());
         }
       } catch (RuntimeException e) {
-        log.warn("Error generating schema for " + getResourceName(handler) + " representation " + rep.getRepresentation(), e);
+        log.warn("Error generating schema for " + schemaName + " representation " + rep.getRepresentation(), e);
       }
     }
 
@@ -260,7 +451,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
 
         Schema<?> repResourceSchema = resolveSchemaForRepHandlerMethod(method, handler, context, chain);
         repResourceSchema.addExtension("x-openmrs-representation", repName);
-        repResourceSchema.name(getResourceName(handler) + "Get_" + repName);
+        repResourceSchema.name(schemaName + "Get_" + repName);
         ret.add(repResourceSchema);
         generatedReps.add(repName);
       }
@@ -271,12 +462,12 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
       ObjectSchema customSchema = resolveCustomRepresentationSchema(handler, context, chain);
       if (customSchema != null) {
         customSchema.addExtension("x-openmrs-representation", "custom");
-        customSchema.name(getResourceName(handler) + "Get_custom");
+        customSchema.name(schemaName + "Get_custom");
         ret.add(customSchema);
         generatedReps.add("custom");
       }
     } catch (RuntimeException e) {
-      log.warn("Error generating custom representation schema for " + getResourceName(handler), e);
+      log.warn("Error generating custom representation schema for " + schemaName, e);
     }
 
     // ========== CREATE representations ==========
@@ -285,12 +476,12 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
       try {
         Schema<?> createResourceSchema = resolveSchemaForResourceDescription(handler, createDesc, true, context, chain);
         if (createResourceSchema != null) {
-          createResourceSchema.name(getResourceName(handler) + "Create");
+          createResourceSchema.name(schemaName + "Create");
           ret.add(createResourceSchema);
           generatedReps.add("create");
         }
       } catch (RuntimeException e) {
-        log.warn("Error generating schema for " + getResourceName(handler) + " create representation", e);
+        log.warn("Error generating schema for " + schemaName + " create representation", e);
       }
     }
 
@@ -300,17 +491,17 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
       try {
         Schema<?> updateResourceSchema = resolveSchemaForResourceDescription(handler, updateDesc, true, context, chain);
         if (updateResourceSchema != null) {
-          updateResourceSchema.name(getResourceName(handler) + "Update");
+          updateResourceSchema.name(schemaName + "Update");
           ret.add(updateResourceSchema);
           generatedReps.add("update");
         }
       } catch (RuntimeException e) {
-        log.warn("Error generating schema for " + getResourceName(handler) + " update representation", e);
+        log.warn("Error generating schema for " + schemaName + " update representation", e);
       }
 
     }
 
-    log.info("Generated schemas for " + getResourceName(handler) + " representations: " + StringUtils.join(generatedReps, ", "));
+    log.info("Generated schemas for " + schemaName + " representations: " + StringUtils.join(generatedReps, ", "));
 
     return ret;
   }
@@ -365,7 +556,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
       return null;
     }
 
-    ObjectSchema objectSchema = new ObjectSchema();
+    ObjectSchema objectSchema = Schemas.object();
     // models  BaseDelegatingConverter#convertDelegateToRepresentation() function
     for (Map.Entry<String, DelegatingResourceDescription.Property> e : desc.getProperties().entrySet()) {
       DelegatingResourceDescription.Property property = e.getValue();
@@ -467,7 +658,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
     } else if(isCollection(propertyType)) {
       Type itemType = TypeFactory.defaultInstance().constructCollectionType(java.util.List.class, TypeFactory.defaultInstance().constructType(propertyType).getContentType()).getContentType();
       if(isOpenmrsObject(itemType)) {
-        ArraySchema arraySchema = new ArraySchema();
+        ArraySchema arraySchema = Schemas.array();
         if(write) {
           arraySchema.items(uuidRefSchema(itemType));
         } else {
@@ -612,7 +803,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
       return null;
     }
 
-    ObjectSchema schema = new ObjectSchema();
+    ObjectSchema schema = Schemas.object();
     for (Map.Entry<String, Method> entry : props.entrySet()) {
       String propName = entry.getKey();
       Method method = entry.getValue();
@@ -628,7 +819,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
         if (isOpenmrsObject(propType)) {
           propSchema = getRefSchemaForResource(propType, Representation.REF);
         } else if (isCollection(propType)) {
-          ArraySchema arraySchema = new ArraySchema();
+          ArraySchema arraySchema = Schemas.array();
           com.fasterxml.jackson.databind.JavaType itemJavaType =
               TypeFactory.defaultInstance().constructType(propType).getContentType();
           if (itemJavaType != null) {
@@ -644,7 +835,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
           // Map types (e.g. Map<String, PersonAttribute>) must NOT go through super.resolve():
           // Jackson would recursively resolve the value type as a full POJO, which cascades
           // inline schema registration for PersonAttribute -> Person -> Concept -> ...
-          ObjectSchema mapSchema = new ObjectSchema();
+          ObjectSchema mapSchema = Schemas.object();
           com.fasterxml.jackson.databind.JavaType valueJavaType =
               TypeFactory.defaultInstance().constructType(propType).getContentType();
           if (valueJavaType != null && isOpenmrsObject(valueJavaType)) {
@@ -692,7 +883,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
           || itemAnn.implementation() != Void.class) {
         Schema<?> itemSchema = buildSchemaFromAnnotation(itemAnn, propertyRep, context, chain);
         if (itemSchema != null) {
-          ArraySchema arr = new ArraySchema();
+          ArraySchema arr = Schemas.array();
           arr.items(itemSchema);
           return arr;
         }
@@ -756,21 +947,126 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
    */
   private static Schema<?> uuidRefSchema(Type delegateType) {
     String resourceName = TypeFactory.rawClass(delegateType).getSimpleName();
-    Schema<?> schema = new Schema<>().type("string").description("UUID of " + resourceName).format("uuid");
+    Schema<?> schema = Schemas.of("string").description("UUID of " + resourceName).format("uuid");
     schema.addExtension("x-openmrs-resource", resourceName);
     return schema;
   }
 
   private Schema<?> getRefSchemaForResource(Type delegateType, Representation rep) {
+    Class<?> rawClass = TypeFactory.rawClass(delegateType);
+    String target = getResourceSpecFilename(delegateType, rep);
+    if (target == null) {
+      return unresolvedTypeSchema(rawClass);
+    }
     Schema<?> ret = new Schema<>();
-    ret.$ref(getResourceSpecFilename(delegateType, rep));
+    ret.$ref(target);
     return ret;
   }
 
+  /**
+   * The {@code $ref} for a property whose declared type is {@code delegateType}, or null when no
+   * resource documents that type.
+   * <p>
+   * The target is the <em>resource that supports the class</em>, not the class itself. Those differ
+   * more often than they look: {@code Allergy} is documented by {@code PatientAllergyResource2_0},
+   * {@code PatientProgram} by {@code ProgramEnrollmentResource}, {@code GlobalProperty} by
+   * {@code SystemSettingResource1_9}. Naming the file after the class produced
+   * {@code ./Allergy.json}, which is never written — 17 of the spec's dangling refs came from here.
+   * <p>
+   * Lookup mirrors {@code RestServiceImpl.getResourceBySupportedClass()}: exact supported class
+   * first, then the most-derived supported superclass. That second step is what resolves
+   * {@code ConceptNumeric} to the {@code Concept} resource, and a subclass-handled class such as
+   * {@code DrugOrder} to {@code Order} — where it can be pinned further to that subtype's variant.
+   */
   public static String getResourceSpecFilename(Type delegateType, Representation rep) {
     Class<?> rawClass = TypeFactory.rawClass(delegateType);
-    String resourceName = rawClass.getSimpleName();
+
+    String variant = VARIANT_BY_SUBCLASS.get(rawClass);
+    if (variant != null) {
+      String parent = PARENT_BY_SUBCLASS.get(rawClass);
+      return "./" + parent + ".json#/schemas/" + parent + "Get_" + rep.getRepresentation()
+          + "_" + variant;
+    }
+
+    String resourceName = resourceNameFor(rawClass);
+    if (resourceName == null) {
+      return null;
+    }
     return "./" + resourceName + ".json#/schemas/" + resourceName + "Get_" + rep.getRepresentation();
+  }
+
+  /** @see RestServiceImpl#getResourceBySupportedClass */
+  private static String resourceNameFor(Class<?> rawClass) {
+    String exact = RESOURCE_NAME_BY_SUPPORTED_CLASS.get(rawClass);
+    if (exact != null) {
+      return exact;
+    }
+    Class<?> best = null;
+    for (Class<?> supported : RESOURCE_NAME_BY_SUPPORTED_CLASS.keySet()) {
+      if (supported.isAssignableFrom(rawClass) && (best == null || best.isAssignableFrom(supported))) {
+        best = supported;
+      }
+    }
+    return best == null ? null : RESOURCE_NAME_BY_SUPPORTED_CLASS.get(best);
+  }
+
+  /**
+   * Stands in for a property whose type no resource documents — {@code AllergyReaction},
+   * {@code ConceptAnswer} and the abstract {@code Attribute}/{@code AttributeType} bases have no
+   * REST resource of their own. Emitting a {@code $ref} to a file that is never written is worse
+   * than admitting the type is undocumented: it makes the whole document unloadable in a strict
+   * consumer.
+   */
+  private static Schema<?> unresolvedTypeSchema(Class<?> rawClass) {
+    Schema<?> schema = Schemas.object();
+    schema.setDescription("A " + rawClass.getSimpleName()
+        + ", which no REST resource documents; shape unspecified");
+    schema.addExtension("x-openmrs-undocumented-type", rawClass.getName());
+    return schema;
+  }
+
+  /**
+   * Registers what each domain class is documented by, so {@code $ref} targets name a resource that
+   * actually exists. Must run before any schema is resolved.
+   *
+   * @param handlers all discovered resource handlers, dependencies included — a cross-module ref
+   *            target is usually a dependency's resource
+   * @param subclassHandlers parent resource handler -> the subclass handlers bound to it
+   */
+  public static void registerResourceNames(List<DelegatingResourceHandler<?>> handlers,
+      Map<DelegatingResourceHandler<?>, List<DelegatingSubclassHandler<?, ?>>> subclassHandlers) {
+    RESOURCE_NAME_BY_SUPPORTED_CLASS.clear();
+    PARENT_BY_SUBCLASS.clear();
+    VARIANT_BY_SUBCLASS.clear();
+
+    for (DelegatingResourceHandler<?> handler : handlers) {
+      Class<?> supported = supportedClassOf(handler);
+      if (supported != null && !RESOURCE_NAME_BY_SUPPORTED_CLASS.containsKey(supported)) {
+        RESOURCE_NAME_BY_SUPPORTED_CLASS.put(supported, getResourceName(handler));
+      }
+    }
+    for (Map.Entry<DelegatingResourceHandler<?>, List<DelegatingSubclassHandler<?, ?>>> entry
+        : subclassHandlers.entrySet()) {
+      String parent = getResourceName(entry.getKey());
+      for (DelegatingSubclassHandler<?, ?> subclassHandler : entry.getValue()) {
+        Class<?> subclass = subclassHandler.getSubclassHandled();
+        if (subclass != null && !VARIANT_BY_SUBCLASS.containsKey(subclass)) {
+          PARENT_BY_SUBCLASS.put(subclass, parent);
+          VARIANT_BY_SUBCLASS.put(subclass, getSubclassTypeName(subclassHandler));
+        }
+      }
+    }
+  }
+
+  /** The {@code supportedClass} of a resource or sub-resource, or null for neither. */
+  private static Class<?> supportedClassOf(DelegatingResourceHandler<?> handler) {
+    org.openmrs.module.webservices.rest.web.annotation.Resource resource = handler.getClass()
+        .getAnnotation(org.openmrs.module.webservices.rest.web.annotation.Resource.class);
+    if (resource != null) {
+      return resource.supportedClass();
+    }
+    org.openmrs.module.webservices.rest.web.annotation.SubResource sub = subResourceAnnotation(handler);
+    return sub == null ? null : sub.supportedClass();
   }
 
   /**

@@ -17,6 +17,7 @@ import org.openmrs.module.webservices.rest.web.resource.api.SubResource;
 import org.openmrs.module.webservices.rest.web.resource.api.Updatable;
 import org.openmrs.module.webservices.rest.web.resource.api.Uploadable;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
+import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingSubclassHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,6 +56,10 @@ public class OpenApiSpecGenerator {
     private List<DelegatingResourceHandler<?>> handlers;
     private List<Class<?>> controllerClasses;
 
+    /** Parent resource handler -> the subclass handlers bound to it. Usually empty. */
+    private java.util.Map<DelegatingResourceHandler<?>, List<DelegatingSubclassHandler<?, ?>>> subclassHandlers =
+            java.util.Collections.emptyMap();
+
     /**
      * Discovers the module's resource handlers and controllers by reflection.
      * <p>
@@ -84,6 +89,14 @@ public class OpenApiSpecGenerator {
         // answer those from what we just discovered.
         StubRuntime.registerRestService(handlers);
 
+        // Subclass handlers are documented as subtypes of the resource they extend, not as
+        // resources in their own right — see OpenMRSResourceModelResolver.resolveSchemasWithSubtypes.
+        subclassHandlers = scanner.findSubclassHandlersByResource(handlers);
+
+        // Cross-resource $ref targets name the resource that supports a class, not the class, so
+        // this has to be known before any schema is resolved.
+        OpenMRSResourceModelResolver.registerResourceNames(handlers, subclassHandlers);
+
         controllerClasses = scanner.findControllers();
     }
 
@@ -92,7 +105,10 @@ public class OpenApiSpecGenerator {
         // The spec describes one module, so it is titled and versioned by that module rather than
         // by openmrs-core. The core version still matters for interpreting the schemas (resources
         // are version-gated via supportedOpenmrsVersions), so it goes in the description.
+        // new OpenAPI(SpecVersion.V31) sets the serialisation behaviour but leaves the version
+        // string at its "3.0.1" default, so the document has to declare 3.1.0 itself.
         OpenAPI openAPI = new OpenAPI(SpecVersion.V31)
+            .openapi("3.1.0")
             .info(new Info()
                 .title(specTitle())
                 .version(moduleVersion != null && !moduleVersion.trim().isEmpty()
@@ -101,6 +117,10 @@ public class OpenApiSpecGenerator {
 
         ModelConverters converters = ModelConverters.getInstance(true);
 
+        // Deliberately NOT .openapi31(true): ModelConverters(true) applies that to its own default
+        // resolver, but turning it on here made things worse, not better (324 typeless schemas
+        // instead of 43). Schemas.normalize() below repairs the type/types split for the whole
+        // document instead, which does not depend on swagger's internal spec-version plumbing.
         converters.addConverter(new OpenMRSResourceModelResolver(Json31.mapper()));
 
         Components components = new Components();
@@ -113,7 +133,17 @@ public class OpenApiSpecGenerator {
             throw new RuntimeException("Unable to create schema output directory: " + schemaDir, e);
         }
 
-        com.fasterxml.jackson.databind.ObjectMapper swaggerMapper = io.swagger.v3.core.util.Json.mapper();
+        // A run writes one file per documented resource but never removed the files of resources it
+        // no longer documents, so a handler that stopped qualifying (a subclass handler failing the
+        // supportedOpenmrsVersions check, a renamed resource) left its file behind — and because
+        // this directory is the module's compiled-resources tree, `package` shipped the stale file
+        // inside the omod JAR. It also made the reported count disagree with the files on disk.
+        clearGeneratedJson(schemaDir);
+        clearGeneratedJson(Paths.get(outputDir, "controllers"));
+
+        // Json31, not Json: the spec is built as SpecVersion.V31 and the 3.0 writer silently drops
+        // 3.1-only constructs (const, type arrays, examples) and stamps "openapi": "3.0.1".
+        com.fasterxml.jackson.databind.ObjectMapper swaggerMapper = io.swagger.v3.core.util.Json31.mapper();
 
         // Two owned handlers can resolve to the same resource name, in which case the second
         // overwrites the first file. Track them so the count reported to the user reconciles
@@ -125,7 +155,8 @@ public class OpenApiSpecGenerator {
 
             // Always resolve schemas — the ModelConverterContext needs every handler processed so
             // that cross-module $ref targets (e.g. Patient, Visit) can be named correctly.
-            ResolvedSchema resolvedSchema = converters.resolveAsResolvedSchema(new OpenmrsResourceAnnotatedType(handler));
+            ResolvedSchema resolvedSchema = converters.resolveAsResolvedSchema(
+                new OpenmrsResourceAnnotatedType(handler, subclassHandlers.get(handler), null));
 
             // Only write files and openapi.json entries for resources defined in this module.
             // Handlers from dependency JARs (REST core, openmrs-api, etc.) are skipped.
@@ -142,24 +173,18 @@ public class OpenApiSpecGenerator {
             log.info("generating " + resourceName);
 
             // Collect schemas for this resource
+            java.util.Map<String, Schema> selected = reachableSchemas(resourceName, resolvedSchema);
             Components resourceComponents = new Components();
-            resourceComponents.addSchemas(resourceName, resolvedSchema.schema);
-            if (resolvedSchema.referencedSchemas != null) {
-                // Only include schemas belonging to this resource (e.g. VisitGet_default, VisitCreate).
-                // OpenMRSResourceModelResolver may register orphaned schemas in the context as a side effect of
-                // calling super.resolve() on complex non-OpenmrsObject types (e.g. CodedOrFreeText,
-                // Allergen). Those schemas are redundant here because cross-resource references are
-                // expressed as $ref pointers to the owning resource's own JSON file, not inline copies.
-                resolvedSchema.referencedSchemas.entrySet().stream()
-                    .filter(e -> e.getKey().startsWith(resourceName))
-                    .forEach(e -> resourceComponents.addSchemas(e.getKey(), e.getValue()));
+            for (java.util.Map.Entry<String, Schema> entry : selected.entrySet()) {
+                resourceComponents.addSchemas(entry.getKey(), entry.getValue());
             }
 
             // Build paths for this resource
             io.swagger.v3.oas.models.Paths resourcePaths = new io.swagger.v3.oas.models.Paths();
-            addPathsForHandler(handler, resourceName, resourcePaths);
+            addPathsForHandler(handler, resourceName, resourcePaths, subtypeNames(handler));
 
             // Write per-resource file: { "schemas": {...}, "paths": {...} }
+            Schemas.normalizeAll(resourceComponents.getSchemas());
             com.fasterxml.jackson.databind.node.ObjectNode root = swaggerMapper.createObjectNode();
             com.fasterxml.jackson.databind.JsonNode componentsJson = swaggerMapper.valueToTree(resourceComponents);
             if (componentsJson.has("schemas")) {
@@ -180,11 +205,8 @@ public class OpenApiSpecGenerator {
             // Add all schemas for this resource directly into components/schemas so that
             // Swagger UI can resolve named $refs (QueueGet, QueueCreate, etc.) without
             // needing to follow external file refs.
-            components.addSchemas(resourceName, resolvedSchema.schema);
-            if (resolvedSchema.referencedSchemas != null) {
-                resolvedSchema.referencedSchemas.entrySet().stream()
-                    .filter(e -> e.getKey().startsWith(resourceName))
-                    .forEach(e -> components.addSchemas(e.getKey(), e.getValue()));
+            for (java.util.Map.Entry<String, Schema> entry : selected.entrySet()) {
+                components.addSchemas(entry.getKey(), entry.getValue());
             }
 
             // Add resource paths to the main openapi.json so they appear in Swagger UI.
@@ -222,11 +244,16 @@ public class OpenApiSpecGenerator {
         openAPI.addTagsItem(new io.swagger.v3.oas.models.tags.Tag().name("Resources"));
         openAPI.addTagsItem(new io.swagger.v3.oas.models.tags.Tag().name("Controllers"));
 
+        // The 3.1 writer emits Schema.types, not the scalar Schema.type, and the two fields are
+        // set independently — reconcile them across the finished document before serialising.
+        Schemas.normalizeAll(openAPI.getComponents() != null ? openAPI.getComponents().getSchemas() : null);
+        Schemas.normalizeAll(pathSchemas(openAPI));
+
         // write the final OpenAPI file
         Path openApiOut = Paths.get(outputDir, outputFile);
         try {
             Files.createDirectories(openApiOut.getParent());
-            String json = io.swagger.v3.core.util.Json.pretty(openAPI);
+            String json = io.swagger.v3.core.util.Json31.pretty(openAPI);
             // Rewrite all file-relative refs to standard component refs so that
             // openapi.json is self-describing with uniform "#/components/schemas/" pointers.
             //
@@ -247,11 +274,112 @@ public class OpenApiSpecGenerator {
     }
 
     /**
+     * Deletes the {@code *.json} files directly inside one of this generator's own output
+     * directories, so a run leaves behind exactly what it documented. Scoped deliberately: only
+     * files, only {@code .json}, only one level deep, and only in a directory this generator
+     * created.
+     */
+    private static void clearGeneratedJson(Path dir) {
+        if (!Files.isDirectory(dir)) {
+            return;
+        }
+        try (java.util.stream.Stream<Path> entries = Files.list(dir)) {
+            for (Path entry : entries.collect(java.util.stream.Collectors.toList())) {
+                if (Files.isRegularFile(entry) && entry.getFileName().toString().endsWith(".json")) {
+                    Files.delete(entry);
+                }
+            }
+        } catch (IOException e) {
+            log.warn("Could not clear stale files in {}: {}", dir, e.getMessage());
+        }
+    }
+
+    /**
+     * The schemas a resource's file must define: its own combined schema plus everything reachable
+     * from it through intra-file {@code #/schemas/...} refs.
+     * <p>
+     * This used to be a prefix test — keep the entries of {@code referencedSchemas} whose name
+     * starts with the resource name — on the reasoning that cross-resource references are external
+     * file refs and so nothing else needs inlining. That holds for {@code OpenmrsObject} properties,
+     * which do get {@code ./Other.json#/schemas/...}, and fails for every other nested POJO:
+     * swagger's {@code ModelResolver} registers those in the context and refs them as bare
+     * {@code #/components/schemas/Foo}, which needs a local definition. Whether one survived came down to a
+     * name coincidence — {@code Module.json} kept {@code ModuleActivator} and dropped
+     * {@code Document}, {@code Extension} and {@code AdvicePoint}, leaving refs to nothing.
+     * <p>
+     * Reachability states the requirement directly, and needs no prefix test at all: every schema
+     * the resource owns is reachable from its combined schema, so resources whose names are
+     * prefixes of one another ({@code Form}/{@code FormResource},
+     * {@code QueueEntry}/{@code QueueEntrySub}) cannot bleed into each other either. External
+     * {@code ./Other.json#/...} refs are deliberately not followed — those are cross-module by
+     * design.
+     */
+    private static java.util.Map<String, Schema> reachableSchemas(String resourceName,
+            ResolvedSchema resolved) {
+        java.util.Map<String, Schema> available = resolved.referencedSchemas != null
+            ? resolved.referencedSchemas : java.util.Collections.<String, Schema> emptyMap();
+
+        java.util.Map<String, Schema> selected = new java.util.LinkedHashMap<String, Schema>();
+        java.util.Deque<String> pending = new java.util.ArrayDeque<String>();
+        selected.put(resourceName, resolved.schema);
+        collectLocalRefs(resolved.schema, pending);
+
+        while (!pending.isEmpty()) {
+            String name = pending.poll();
+            if (selected.containsKey(name)) {
+                continue;
+            }
+            Schema referenced = available.get(name);
+            if (referenced == null) {
+                // Defined by another resource's run; it will be a cross-module ref there.
+                continue;
+            }
+            selected.put(name, referenced);
+            collectLocalRefs(referenced, pending);
+        }
+        return selected;
+    }
+
+    /** Queues the targets of every intra-file {@code #/schemas/<name>} ref in a schema. */
+    private static void collectLocalRefs(Object node, java.util.Deque<String> pending) {
+        if (node instanceof Schema) {
+            Schema<?> schema = (Schema<?>) node;
+            String ref = schema.get$ref();
+            if (ref != null) {
+                // Two intra-document forms coexist: this plugin writes "#/schemas/Foo", swagger's
+                // own ModelResolver writes "#/components/schemas/Foo". The final rewrite collapses
+                // them, so the difference is invisible in the output but matters here.
+                if (ref.startsWith("#/components/schemas/")) {
+                    pending.add(ref.substring("#/components/schemas/".length()));
+                } else if (ref.startsWith("#/schemas/")) {
+                    pending.add(ref.substring("#/schemas/".length()));
+                }
+            }
+            if (schema.getProperties() != null) {
+                for (Object value : schema.getProperties().values()) {
+                    collectLocalRefs(value, pending);
+                }
+            }
+            collectLocalRefs(schema.getItems(), pending);
+            collectLocalRefs(schema.getNot(), pending);
+            collectLocalRefs(schema.getAdditionalProperties(), pending);
+            collectLocalRefs(schema.getAllOf(), pending);
+            collectLocalRefs(schema.getAnyOf(), pending);
+            collectLocalRefs(schema.getOneOf(), pending);
+        } else if (node instanceof java.util.List) {
+            for (Object item : (java.util.List<?>) node) {
+                collectLocalRefs(item, pending);
+            }
+        }
+    }
+
+    /**
      * Builds OpenAPI PathItem objects for a resource and adds them to the Paths map.
      * Mirrors the dispatch logic in MainResourceController: each ability interface
      * corresponds to specific HTTP routes.
      */
-    private static void addPathsForHandler(DelegatingResourceHandler<?> handler, String resourceName, io.swagger.v3.oas.models.Paths paths) {
+    private static void addPathsForHandler(DelegatingResourceHandler<?> handler, String resourceName,
+            io.swagger.v3.oas.models.Paths paths, List<String> subtypes) {
         if (handler instanceof SubResource) {
             addSubResourcePaths(handler, resourceName, paths);
             return;
@@ -268,20 +396,32 @@ public class OpenApiSpecGenerator {
                 ? "List or search " + resourceName + " resources"
                 : handler instanceof Listable ? "List all " + resourceName + " resources"
                                               : "Search " + resourceName + " resources";
-            Schema<?> resultItems = new Schema<>().$ref(schemaRef + resourceName + "Get_ref");
-            Schema<?> responseBody = new ObjectSchema()
-                .addProperty("results", new ArraySchema().items(resultItems))
-                .addProperty("links", new ArraySchema().items(new ObjectSchema()));
-            collectionItem.get(new Operation()
+            Schema<?> resultItems = Schemas.ref(schemaRef + resourceName + "Get_ref");
+            Schema<?> responseBody = Schemas.object()
+                .addProperty("results", Schemas.array().items(resultItems))
+                .addProperty("links", Schemas.array().items(Schemas.object()));
+            Operation listOp = new Operation()
                 .summary(summary)
                 .addParametersItem(vParam())
                 .responses(new ApiResponses().addApiResponse("200",
-                    new ApiResponse().description("Success").content(jsonContent(responseBody)))));
+                    new ApiResponse().description("Success").content(jsonContent(responseBody))));
+            if (!subtypes.isEmpty()) {
+                listOp.addParametersItem(typeParam(subtypes));
+            }
+            collectionItem.get(listOp);
         }
 
         // Creatable and Uploadable both map to POST on the collection path.
         // Combine them into one operation with multiple accepted content types.
-        boolean isCreatable = handler instanceof org.openmrs.module.webservices.rest.web.resource.api.Creatable;
+        //
+        // Implementing Creatable is not enough: DelegatingCrudResource.create() calls
+        // getCreatableProperties(), which BaseDelegatingResource implements as an unconditional
+        // ResourceDoesNotSupportOperationException. A resource that neither overrides it nor
+        // describes creatable properties therefore cannot be created at all — CareSetting throws
+        // explicitly, ConceptReferenceRange and CustomDatatype simply inherit the default — and
+        // the <Resource>Create schema those requests would reference is never generated.
+        boolean isCreatable = handler instanceof org.openmrs.module.webservices.rest.web.resource.api.Creatable
+            && OpenMRSResourceModelResolver.hasCreateSchema(handler);
         if (isCreatable || handler instanceof Uploadable) {
             String summary = isCreatable && handler instanceof Uploadable
                 ? "Create a new " + resourceName + " or upload a file"
@@ -290,19 +430,19 @@ public class OpenApiSpecGenerator {
             Content requestContent = new Content();
             if (isCreatable) {
                 requestContent.addMediaType("application/json",
-                    new MediaType().schema(new Schema<>().$ref(schemaRef + resourceName + "Create")));
+                    new MediaType().schema(Schemas.ref(schemaRef + resourceName + "Create")));
             }
             if (handler instanceof Uploadable) {
                 requestContent.addMediaType("multipart/form-data",
-                    new MediaType().schema(new ObjectSchema()
-                        .addProperty("file", new Schema<>().type("string").format("binary"))));
+                    new MediaType().schema(Schemas.object()
+                        .addProperty("file", Schemas.of("string").format("binary"))));
             }
             collectionItem.post(new Operation()
                 .summary(summary)
                 .requestBody(new RequestBody().required(true).content(requestContent))
                 .responses(new ApiResponses().addApiResponse("201",
                     new ApiResponse().description("Created").content(
-                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get_default"))))));
+                        jsonContent(Schemas.ref(schemaRef + resourceName + "Get_default"))))));
         }
 
         if (collectionItem.readOperationsMap() != null && !collectionItem.readOperationsMap().isEmpty()) {
@@ -314,7 +454,7 @@ public class OpenApiSpecGenerator {
         PathItem instanceItem = new PathItem();
         Parameter uuidParam = new Parameter().name("uuid").in("path").required(true)
             .description("UUID of the " + resourceName)
-            .schema(new Schema<>().type("string"));
+            .schema(Schemas.of("string"));
 
         if (handler instanceof Retrievable) {
             instanceItem.get(new Operation()
@@ -323,19 +463,22 @@ public class OpenApiSpecGenerator {
                 .addParametersItem(vParam())
                 .responses(new ApiResponses().addApiResponse("200",
                     new ApiResponse().description("Success").content(
-                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get"))))));
+                        jsonContent(Schemas.ref(schemaRef + resourceName + "Get"))))));
         }
 
-        if (handler instanceof Updatable) {
+        // Same for Updatable: getUpdatableProperties() delegates to getCreatableProperties() by
+        // default, so it throws for the same resources. Order overrides it to throw outright —
+        // orders are immutable in OpenMRS.
+        if (handler instanceof Updatable && OpenMRSResourceModelResolver.hasUpdateSchema(handler)) {
             // The update endpoint also handles undelete when the body is {deleted: false}
             instanceItem.post(new Operation()
                 .summary("Update a " + resourceName + " (send {deleted: false} to undelete)")
                 .addParametersItem(uuidParam)
                 .requestBody(new RequestBody().required(true).content(
-                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Update"))))
+                    jsonContent(Schemas.ref(schemaRef + resourceName + "Update"))))
                 .responses(new ApiResponses().addApiResponse("200",
                     new ApiResponse().description("Updated").content(
-                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get_default"))))));
+                        jsonContent(Schemas.ref(schemaRef + resourceName + "Get_default"))))));
         }
 
         if (handler instanceof Deletable || handler instanceof Purgeable) {
@@ -347,12 +490,12 @@ public class OpenApiSpecGenerator {
             if (handler instanceof Deletable) {
                 deleteOp.addParametersItem(new Parameter().name("reason").in("query")
                     .description("Reason for voiding or retiring")
-                    .schema(new Schema<>().type("string")));
+                    .schema(Schemas.of("string")));
             }
             if (handler instanceof Purgeable) {
                 deleteOp.addParametersItem(new Parameter().name("purge").in("query")
                     .description("Set to true to permanently delete instead of voiding or retiring")
-                    .schema(new Schema<>().type("boolean")));
+                    .schema(Schemas.of("boolean")));
             }
             deleteOp.responses(new ApiResponses().addApiResponse("204",
                 new ApiResponse().description("No Content")));
@@ -396,10 +539,10 @@ public class OpenApiSpecGenerator {
         // ---- Collection path (parent UUID only): GET getAll, POST create, PUT replace ----
         PathItem collectionItem = new PathItem();
 
-        Schema<?> resultItems = new Schema<>().$ref(schemaRef + resourceName + "Get_ref");
-        Schema<?> responseBody = new ObjectSchema()
-            .addProperty("results", new ArraySchema().items(resultItems))
-            .addProperty("links", new ArraySchema().items(new ObjectSchema()));
+        Schema<?> resultItems = Schemas.ref(schemaRef + resourceName + "Get_ref");
+        Schema<?> responseBody = Schemas.object()
+            .addProperty("results", Schemas.array().items(resultItems))
+            .addProperty("links", Schemas.array().items(Schemas.object()));
         collectionItem.get(new Operation()
             .summary("List the " + resourceName + " sub-resources" + ofParent)
             .addParametersItem(parentUuidParam(parentName))
@@ -416,10 +559,10 @@ public class OpenApiSpecGenerator {
                 .summary("Add a " + resourceName + " to a " + (parentName != null ? parentName : "parent"))
                 .addParametersItem(parentUuidParam(parentName))
                 .requestBody(new RequestBody().required(true).content(
-                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Create"))))
+                    jsonContent(Schemas.ref(schemaRef + resourceName + "Create"))))
                 .responses(new ApiResponses().addApiResponse("201",
                     new ApiResponse().description("Created").content(
-                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get_default"))))));
+                        jsonContent(Schemas.ref(schemaRef + resourceName + "Get_default"))))));
         }
 
         // PUT is the one operation that is statically detectable: DelegatingSubResource.put()
@@ -432,7 +575,7 @@ public class OpenApiSpecGenerator {
                 .summary("Replace the " + resourceName + " sub-resources" + ofParent)
                 .addParametersItem(parentUuidParam(parentName))
                 .requestBody(new RequestBody().required(true).content(
-                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Create"))))
+                    jsonContent(Schemas.ref(schemaRef + resourceName + "Create"))))
                 .responses(new ApiResponses().addApiResponse("204",
                     new ApiResponse().description("No Content"))));
         }
@@ -448,7 +591,7 @@ public class OpenApiSpecGenerator {
         PathItem instanceItem = new PathItem();
         Parameter uuidParam = new Parameter().name("uuid").in("path").required(true)
             .description("UUID of the " + resourceName)
-            .schema(new Schema<>().type("string"));
+            .schema(Schemas.of("string"));
 
         instanceItem.get(new Operation()
             .summary("Retrieve a " + resourceName + " by UUID")
@@ -457,7 +600,7 @@ public class OpenApiSpecGenerator {
             .addParametersItem(vParam())
             .responses(new ApiResponses().addApiResponse("200",
                 new ApiResponse().description("Success").content(
-                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get"))))));
+                    jsonContent(Schemas.ref(schemaRef + resourceName + "Get"))))));
 
         if (OpenMRSResourceModelResolver.hasUpdateSchema(handler)) {
             instanceItem.post(new Operation()
@@ -465,10 +608,10 @@ public class OpenApiSpecGenerator {
                 .addParametersItem(parentUuidParam(parentName))
                 .addParametersItem(uuidParam)
                 .requestBody(new RequestBody().required(true).content(
-                    jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Update"))))
+                    jsonContent(Schemas.ref(schemaRef + resourceName + "Update"))))
                 .responses(new ApiResponses().addApiResponse("200",
                     new ApiResponse().description("Updated").content(
-                        jsonContent(new Schema<>().$ref(schemaRef + resourceName + "Get_default"))))));
+                        jsonContent(Schemas.ref(schemaRef + resourceName + "Get_default"))))));
         }
 
         instanceItem.delete(new Operation()
@@ -477,10 +620,10 @@ public class OpenApiSpecGenerator {
             .addParametersItem(uuidParam)
             .addParametersItem(new Parameter().name("reason").in("query")
                 .description("Reason for voiding or retiring")
-                .schema(new Schema<>().type("string")))
+                .schema(Schemas.of("string")))
             .addParametersItem(new Parameter().name("purge").in("query")
                 .description("Set to true to permanently delete instead of voiding or retiring")
-                .schema(new Schema<>().type("boolean")))
+                .schema(Schemas.of("boolean")))
             .responses(new ApiResponses().addApiResponse("204",
                 new ApiResponse().description("No Content"))));
 
@@ -510,7 +653,85 @@ public class OpenApiSpecGenerator {
     private static Parameter parentUuidParam(String parentName) {
         return new Parameter().name("parentUuid").in("path").required(true)
             .description("UUID of the parent " + (parentName != null ? parentName : "resource"))
-            .schema(new Schema<>().type("string"));
+            .schema(Schemas.of("string"));
+    }
+
+    /**
+     * MainResourceController reads the subtype to list by from {@code ?t=}
+     * ({@code RestConstants.REQUEST_PROPERTY_FOR_TYPE}), which routes to the handler's
+     * {@code getAllByType()}. Only meaningful for a resource with a class hierarchy.
+     */
+    private static Parameter typeParam(List<String> subtypes) {
+        Schema<String> schema = Schemas.<String>of("string");
+        for (String subtype : subtypes) {
+            schema.addEnumItemObject(subtype);
+        }
+        return new Parameter().name("t").in("query")
+            .description("Restrict results to one subtype")
+            .schema(schema);
+    }
+
+    /** The type names a resource's bound subclass handlers expose, or empty when it has none. */
+    private List<String> subtypeNames(DelegatingResourceHandler<?> handler) {
+        List<DelegatingSubclassHandler<?, ?>> bound = subclassHandlers.get(handler);
+        if (bound == null || bound.isEmpty()) {
+            return java.util.Collections.emptyList();
+        }
+        // Subclass type names only. DelegatingCrudResource.getAll() looks the value up with
+        // getSubclassHandler(type) and throws "No handler is specified for t=..." when it misses,
+        // so ?t=<base type> is rejected even though the base type is a valid discriminator value in
+        // responses — listing the base type is the default behaviour, expressed by omitting ?t=.
+        List<String> names = new java.util.ArrayList<String>();
+        for (DelegatingSubclassHandler<?, ?> subclassHandler : bound) {
+            names.add(OpenMRSResourceModelResolver.getSubclassTypeName(subclassHandler));
+        }
+        return names;
+    }
+
+    /**
+     * Every schema reachable from the document's paths — parameters, request bodies and responses —
+     * keyed arbitrarily, since {@link Schemas#normalizeAll} only iterates the values.
+     */
+    private static java.util.Map<String, Schema> pathSchemas(OpenAPI openAPI) {
+        java.util.Map<String, Schema> collected = new java.util.LinkedHashMap<String, Schema>();
+        if (openAPI.getPaths() == null) {
+            return collected;
+        }
+        int i = 0;
+        for (PathItem item : openAPI.getPaths().values()) {
+            for (Operation op : item.readOperations()) {
+                if (op.getParameters() != null) {
+                    for (Parameter parameter : op.getParameters()) {
+                        i = collect(collected, parameter.getSchema(), i);
+                    }
+                }
+                if (op.getRequestBody() != null) {
+                    i = collectContent(collected, op.getRequestBody().getContent(), i);
+                }
+                if (op.getResponses() != null) {
+                    for (ApiResponse response : op.getResponses().values()) {
+                        i = collectContent(collected, response.getContent(), i);
+                    }
+                }
+            }
+        }
+        return collected;
+    }
+
+    private static int collectContent(java.util.Map<String, Schema> collected, Content content, int i) {
+        if (content != null) {
+            for (MediaType mediaType : content.values()) {
+                i = collect(collected, mediaType.getSchema(), i);
+            }
+        }
+        return i;
+    }
+
+    private static int collect(java.util.Map<String, Schema> collected, Schema schema, int i) {
+        if (schema != null) {
+            collected.put(String.valueOf(i++), schema);
+        }
+        return i;
     }
 
     private static void tagPathItem(PathItem item, String tag) {
@@ -527,16 +748,38 @@ public class OpenApiSpecGenerator {
     private static Parameter vParam() {
         return new Parameter().name("v").in("query")
             .description("The representation to return (ref, default, full, or custom)")
-            .schema(new Schema<>().type("string")._default("default"));
+            .schema(Schemas.of("string")._default("default"));
     }
 
     /**
      * Returns true if the handler's class was loaded from this module's own compiled output
      * (target/classes) or a sibling artifact of the same Maven project, false if it came from a
      * dependency JAR. Falls back to true when no owned locations were supplied.
+     * <p>
+     * A module can also own only a <em>subtype</em> of a resource: registering a
+     * {@code DelegatingSubclassHandler} against another module's resource (core's {@code v1/order},
+     * say) changes that endpoint's shape wherever this module is installed, and since subclass
+     * handlers are documented as part of their parent rather than as resources of their own, the
+     * contribution would otherwise vanish from this module's spec entirely. So the parent is
+     * documented too, and the run says why.
      */
     private boolean isModuleOwnedHandler(DelegatingResourceHandler<?> handler) {
-        return ModuleOwnership.isOwned(handler.getClass(), ownedLocations);
+        if (ModuleOwnership.isOwned(handler.getClass(), ownedLocations)) {
+            return true;
+        }
+        List<DelegatingSubclassHandler<?, ?>> bound = subclassHandlers.get(handler);
+        if (bound == null) {
+            return false;
+        }
+        for (DelegatingSubclassHandler<?, ?> subclassHandler : bound) {
+            if (ModuleOwnership.isOwned(subclassHandler.getClass(), ownedLocations)) {
+                System.out.println("Documenting " + handler.getClass().getName()
+                        + ", which belongs to another module, because this module adds the subtype '"
+                        + OpenMRSResourceModelResolver.getSubclassTypeName(subclassHandler) + "' to it");
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
