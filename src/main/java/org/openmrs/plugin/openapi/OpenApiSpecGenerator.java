@@ -203,13 +203,13 @@ public class OpenApiSpecGenerator {
             System.out.println("Wrote schema file: " + outFile.toAbsolutePath());
 
             // Add all schemas for this resource directly into components/schemas so that
-            // Swagger UI can resolve named $refs (QueueGet, QueueCreate, etc.) without
+            // Renderers can resolve named $refs (QueueGet, QueueCreate, etc.) without
             // needing to follow external file refs.
             for (java.util.Map.Entry<String, Schema> entry : selected.entrySet()) {
                 components.addSchemas(entry.getKey(), entry.getValue());
             }
 
-            // Add resource paths to the main openapi.json so they appear in Swagger UI.
+            // Add resource paths to the main openapi.json so they appear in the rendered docs.
             // (Controller paths are added separately via ControllerDocumenter below.)
             if (!resourcePaths.isEmpty()) {
                 if (openAPI.getPaths() == null) {

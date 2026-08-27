@@ -2,14 +2,14 @@
 #
 # serve.sh — OpenMRS OpenAPI dev server
 #
-# Serves Swagger UI for one or more OpenMRS modules whose OpenAPI specs have
-# already been generated (via `mvn openmrs-openapi:generate`
-# or run-it.sh). The UI has a sidebar listing each module plus an "All" view
-# that merges all modules into one combined spec.
+# Serves API reference docs for one or more OpenMRS modules whose OpenAPI specs
+# have already been generated (via ./generate.sh). The UI has a sidebar listing
+# each module plus an "All" view that merges all modules into one combined spec.
 #
-# API calls made from the Swagger UI are proxied through this server to avoid
-# CORS issues. You authenticate via Basic Auth in the Swagger UI "Authorize"
-# dialog — credentials are forwarded with every proxied request.
+# API calls made from the docs UI are proxied through this server to avoid CORS
+# issues. The served specs declare an HTTP Basic security scheme, so entering
+# your OpenMRS username and password in the UI's authentication controls is
+# enough — credentials are forwarded with every proxied request.
 #
 # Cross-module $refs (e.g. Queue referencing Location from the REST module) are
 # resolved automatically when all relevant modules are passed as arguments.
@@ -31,8 +31,7 @@
 #       ../openmrs-module-webservices.rest ../openmrs-module-queue
 #
 # Prerequisites:
-#   - Run ./generate.sh <module-path> for each module first (or use run-it.sh, which
-#     does this automatically for webservices.rest).
+#   - Run ./generate.sh <module-path> ... for the modules first.
 #   - The dev server JAR is built automatically on first run if not present.
 #
 set -euo pipefail

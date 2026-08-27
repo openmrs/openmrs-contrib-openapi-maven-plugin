@@ -25,12 +25,13 @@ import java.util.Set;
 
 /**
  * Lightweight dev server that reads one or more modules' generated openapi directories
- * and serves them via Swagger UI with a per-module sidebar and an "All" merged view.
+ * and serves them as browsable API reference docs with a per-module sidebar and an
+ * "All" merged view.
  *
  * Usage: java -jar openapi-dev-server.jar --server=<url> [--port=9000] <module-path>...
  *
  * URL layout:
- *   /                              Swagger UI with sidebar
+ *   /                              docs UI with sidebar
  *   /specs/all/openapi.json        merged spec from all modules
  *   /specs/<module>/openapi.json   per-module spec
  *   /specs/<module>/resources/*.json
@@ -375,27 +376,43 @@ public class OpenApiDevServer {
             send(exchange, 404, "text/plain", "Not found: " + path);
         }
 
+        /**
+         * Renders the reference UI for one module.
+         * <p>
+         * Which renderer to standardise on is still an open question; the one wired in below is
+         * the current pick, not a settled choice. The comparison harness in
+         * openapi-dev-server/renderer-compare/ serves the same spec to six renderers side by side
+         * and its README records why this one leads — read that before swapping it.
+         * <p>
+         * Switching module reloads the page rather than re-initialising in place: the spec URL is
+         * chosen here and baked into the script tag, which keeps this independent of the CDN
+         * bundle's JS entry point.
+         */
         private void serveUi(HttpExchange exchange) throws IOException {
-            StringBuilder sidebarItems = new StringBuilder();
-            sidebarItems.append("<a href='#' class='sidebar-item' onclick='loadSpec(\"all\"); return false;'>All</a>\n");
-            for (String name : moduleSpecs.keySet()) {
-                sidebarItems.append("<a href='#' class='sidebar-item' onclick='loadSpec(\"")
-                    .append(name).append("\"); return false;'>").append(name).append("</a>\n");
+            String query = exchange.getRequestURI().getRawQuery();
+            String requested = null;
+            if (query != null) {
+                for (String param : query.split("&")) {
+                    if (param.startsWith("module=")) {
+                        requested = urlDecode(param.substring("module=".length()));
+                    }
+                }
             }
+            String selected = (requested != null && moduleSpecs.containsKey(requested)) ? requested : "all";
 
-            StringBuilder specUrls = new StringBuilder("[");
-            specUrls.append("\"all\"");
+            StringBuilder sidebarItems = new StringBuilder();
+            sidebarItems.append(sidebarLink("all", "All", selected));
             for (String name : moduleSpecs.keySet()) {
-                specUrls.append(", \"").append(name).append("\"");
+                sidebarItems.append(sidebarLink(name, name, selected));
             }
-            specUrls.append("]");
 
             String html = "<!DOCTYPE html>\n<html>\n<head>\n"
                 + "  <title>OpenMRS REST API</title>\n"
                 + "  <meta charset='utf-8'/>\n"
-                + "  <link rel='stylesheet' href='https://unpkg.com/swagger-ui-dist/swagger-ui.css'>\n"
+                + "  <meta name='viewport' content='width=device-width, initial-scale=1'/>\n"
                 + "  <style>\n"
-                + "    body { margin: 0; display: flex; font-family: sans-serif; }\n"
+                + "    html, body { margin: 0; height: 100%; }\n"
+                + "    body { display: flex; font-family: sans-serif; }\n"
                 + "    #sidebar {\n"
                 + "      width: 220px; min-width: 220px; height: 100vh; overflow-y: auto;\n"
                 + "      background: #1b1b1b; padding: 16px 0; box-sizing: border-box;\n"
@@ -408,38 +425,40 @@ public class OpenApiDevServer {
                 + "    }\n"
                 + "    .sidebar-item:hover { background: #2a2a2a; color: #fff; }\n"
                 + "    .sidebar-item.active { color: #fff; border-left-color: #89bf04; background: #2a2a2a; }\n"
-                + "    #swagger-container { flex: 1; overflow-y: auto; height: 100vh; }\n"
+                + "    #api-container { flex: 1; height: 100vh; overflow-y: auto; }\n"
                 + "  </style>\n"
                 + "</head>\n<body>\n"
                 + "  <div id='sidebar'>\n"
                 + "    <h3>Modules</h3>\n"
                 + sidebarItems
                 + "  </div>\n"
-                + "  <div id='swagger-container'><div id='swagger-ui'></div></div>\n"
-                + "  <script src='https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js'></script>\n"
-                + "  <script>\n"
-                + "    const SPECS = " + specUrls + ";\n"
-                + "    let ui = null;\n"
-                + "    function loadSpec(name) {\n"
-                + "      document.querySelectorAll('.sidebar-item').forEach(el => el.classList.remove('active'));\n"
-                + "      const link = [...document.querySelectorAll('.sidebar-item')].find(el => el.textContent === name || (name === 'all' && el.textContent === 'All'));\n"
-                + "      if (link) link.classList.add('active');\n"
-                + "      document.getElementById('swagger-ui').innerHTML = '';\n"
-                + "      ui = SwaggerUIBundle({\n"
-                + "        url: '/specs/' + name + '/openapi.json',\n"
-                + "        dom_id: '#swagger-ui',\n"
-                + "        presets: [SwaggerUIBundle.presets.apis, SwaggerUIBundle.SwaggerUIStandalonePreset],\n"
-                + "        layout: 'BaseLayout',\n"
-                + "        deepLinking: false,\n"
-                + "        filter: true\n"
-                + "      });\n"
-                + "      history.replaceState(null, '', '?module=' + name);\n"
-                + "    }\n"
-                + "    const initial = new URLSearchParams(window.location.search).get('module') || 'all';\n"
-                + "    loadSpec(SPECS.includes(initial) ? initial : 'all');\n"
-                + "  </script>\n"
+                + "  <div id='api-container'>\n"
+                + "    <script id='api-reference' data-url='/specs/" + selected + "/openapi.json'></script>\n"
+                + "  </div>\n"
+                + "  <script src='https://cdn.jsdelivr.net/npm/@scalar/api-reference'></script>\n"
                 + "</body>\n</html>";
             send(exchange, 200, "text/html; charset=utf-8", html);
+        }
+
+        private static String sidebarLink(String module, String label, String selected) {
+            return "<a class='sidebar-item" + (module.equals(selected) ? " active" : "")
+                + "' href='?module=" + urlEncode(module) + "'>" + label + "</a>\n";
+        }
+
+        private static String urlEncode(String value) {
+            try {
+                return java.net.URLEncoder.encode(value, "UTF-8");
+            } catch (java.io.UnsupportedEncodingException e) {
+                return value;
+            }
+        }
+
+        private static String urlDecode(String value) {
+            try {
+                return java.net.URLDecoder.decode(value, "UTF-8");
+            } catch (java.io.UnsupportedEncodingException e) {
+                return value;
+            }
         }
 
         private void serveJson(HttpExchange exchange, byte[] bytes) throws IOException {
