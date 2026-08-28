@@ -945,6 +945,9 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
     PropertyGetter pg = getter.getAnnotation(PropertyGetter.class);
     if (pg == null) return null;
 
+    /*
+     * TODO: Uncomment this when this is fixed: https://openmrs.atlassian.net/browse/RESTWS-1042
+
     // arraySchema() and schema() were added to @PropertyGetter in REST module 4.0+.
     // Older modules compile against a version that lacks these elements; calling them
     // throws AbstractMethodError. Treat that as "no hint present".
@@ -970,6 +973,7 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
     } catch (NoSuchMethodError | AbstractMethodError ignored) {
       // @PropertyGetter on this module's REST version has no schema()/arraySchema() elements
     }
+    */
 
     return null;
   }

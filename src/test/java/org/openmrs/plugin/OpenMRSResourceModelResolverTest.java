@@ -39,9 +39,11 @@ class OpenMRSResourceModelResolverTest {
 
         SimpleObject getRaw();
 
+        /** TODO: uncomment after this is fixed: https://openmrs.atlassian.net/browse/RESTWS-1040
         SimpleObject<?> getWildcard();
 
         SimpleObject<TypedPayload> getTyped();
+        */
     }
 
     private static ModelConverters newConverters() {
@@ -64,6 +66,8 @@ class OpenMRSResourceModelResolverTest {
         assertNull(resolved.schema.getProperties());
     }
 
+    /*
+     * TODO: uncomment after this is fixed: https://openmrs.atlassian.net/browse/RESTWS-1040
     @Test
     void resolve_shouldReturnGenericObjectSchemaForWildcardSimpleObject() throws Exception {
         ResolvedSchema resolved = resolve("getWildcard");
@@ -96,4 +100,5 @@ class OpenMRSResourceModelResolverTest {
         assertTrue(properties.containsKey("name"));
         assertTrue(properties.containsKey("count"));
     }
+    */
 }
