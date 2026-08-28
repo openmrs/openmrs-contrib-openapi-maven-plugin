@@ -37,7 +37,8 @@ spec describes what the module will actually do.
 
 ## Development Quick Start
 
-If you have multiple versions of Java, make sure to use the right one.
+If you have multiple versions of Java, make sure to use the right one (21) to build this repo. Note
+that this module should work with target modules built with different java versions.
 
 ```bash
 export JAVA_HOME=/path/to/jdk-21
@@ -115,7 +116,7 @@ versions and REST-resource styles in the ecosystem:
 | Module | Branch | 
 |---|---|
 | [`openmrs-module-webservices.rest`](https://github.com/openmrs/openmrs-module-webservices.rest) | 3.x |
-| [`openmrs-module-queue`](https://github.com/openmrs/openmrs-module-queue) | `omod/` | master |
+| [`openmrs-module-queue`](https://github.com/openmrs/openmrs-module-queue) | master |
 | [`openmrs-module-appointments`](https://github.com/openmrs/openmrs-module-appointments) | master |
 | [`openmrs-module-emrapi`](https://github.com/openmrs/openmrs-module-emrapi) | master |
 
