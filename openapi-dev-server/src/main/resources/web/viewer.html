@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>OpenMRS API — resource</title>
+<!--
+  The renderer frame. One resource or controller at a time, addressed by ?spec=.
+
+  It lives in an iframe rather than in the shell page so that switching resources tears the
+  renderer down completely. Swagger UI holds the ingested spec in its own Redux store, and
+  re-initialising it in place leaves the previous document's schemas behind; a fresh frame is both
+  simpler and cheaper than persuading it to forget.
+-->
+<link rel="stylesheet" href="swagger-ui.css">
+<style>
+  /* The shell already names the resource, so the frame does not repeat it. */
+  .swagger-ui .topbar, .swagger-ui .info { display: none; }
+  .swagger-ui { padding-top: 8px; }
+  #loading { font: 13px system-ui, sans-serif; color: #666; padding: 18px 20px; }
+</style>
+</head>
+<body>
+<div id="loading">rendering…</div>
+<div id="swagger-ui"></div>
+<script src="swagger-ui-bundle.js"></script>
+<script src="named-types.js"></script>
+<script>
+  var params = new URLSearchParams(location.search);
+  var spec = params.get('spec');
+  // 'list' expands the tag sections but leaves each operation collapsed. Worth having as a knob:
+  // Swagger UI mounts every expanded operation eagerly — it has no virtualization — so on a big
+  // document this is the difference between a hundred DOM nodes and twenty thousand. Per resource
+  // it is a handful of operations either way.
+  var expand = params.get('expand') || 'list';
+
+  window.ui = SwaggerUIBundle({
+    url: spec,
+    dom_id: '#swagger-ui',
+    presets: [SwaggerUIBundle.presets.apis],
+    layout: 'BaseLayout',
+    // The shell owns the URL; letting the renderer write location.hash too would fight it.
+    deepLinking: false,
+    // Per-resource documents are small enough to read whole, so the operation filter would only
+    // get in the way — the shell's search covers every module at once.
+    filter: false,
+    docExpansion: expand,
+    defaultModelsExpandDepth: 1,
+    plugins: params.get('names') === '0' ? [] : [window.NamedUnionTypesPlugin],
+    onComplete: function () {
+      var loading = document.getElementById('loading');
+      if (loading) { loading.remove(); }
+      // Tells the shell to stop its stopwatch. Same origin, so this is just a function call.
+      if (window.parent && window.parent.specRendered) {
+        window.parent.specRendered(spec);
+      }
+    }
+  });
+</script>
+</body>
+</html>

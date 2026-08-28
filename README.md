@@ -136,13 +136,14 @@ that stops qualifying does not leave a stale file behind to be packaged.
 
 ## Browsing the docs — `./serve.sh`
 
-`serve.sh` starts a small local dev server (`openapi-dev-server/`, ~500 lines on the JDK's built-in
-HTTP server) that renders the generated specs as browsable API reference documentation and lets you
-fire real requests at a live OpenMRS instance from the page.
+`serve.sh` starts a local dev server (`openapi-dev-server/`) that renders the generated specs as
+browsable API reference documentation and lets you fire real requests at a live OpenMRS instance
+from the page.
 
 ```bash
 ./serve.sh --server=https://dev3.openmrs.org/openmrs \
-    ../openmrs-module-webservices.rest ../openmrs-module-queue
+    ../openmrs-module-webservices.rest ../openmrs-module-queue \
+    ../openmrs-module-appointments ../openmrs-module-emrapi
 ```
 
 Then open <http://localhost:9000>.
@@ -151,46 +152,108 @@ Then open <http://localhost:9000>.
 |---|---|
 | `--server=<url>` | **required** — base URL of the OpenMRS instance to proxy API calls to. Do *not* include `/ws`. |
 | `--port=<port>` | local port to listen on; defaults to `9000` |
+| `--self-check` | slice every resource before serving and report the totals, cross-module borrowing and any unresolved `$ref`; exits non-zero if anything dangles |
 | `<module-path>...` | one or more module roots that have already been generated |
 
-What it gives you:
+### What the UI does
 
-- **A sidebar of modules**, plus an `All` entry that merges every module passed in into a single
-  combined document. Each module is labelled by its directory name.
-- **Cross-module `$ref` resolution.** `queue` references `Location` from the REST module; when both
-  modules are passed as arguments the missing schemas are pulled in from the sibling specs, applied
-  transitively until stable. Pass the modules you want resolved together.
-- **A reverse proxy at `/proxy/*`.** The served specs have their `servers` block rewritten to
-  `/proxy`, so "try it" requests go to the dev server and are forwarded upstream — which sidesteps
-  CORS entirely. The specs also declare an HTTP Basic security scheme, so entering your OpenMRS
-  username and password in the UI's authentication controls is enough; the credentials are forwarded
-  with every proxied request.
+A search box and a tree on the left, one resource rendered on the right:
+
+```
+webservices.rest
+  RESOURCES
+    Patient
+      PatientIdentifier          ← sub-resources nest under the resource they hang off
+    Concept
+  CONTROLLERS
+    SessionController
+queue
+  ...
+```
+
+- **Search covers every module at once** — names, routes, operation summaries and property names.
+  Exact and prefix name matches rank above incidental field hits, so `patient` leads with the
+  Patient resource rather than the dozen resources that merely have a `patient` field. A match on
+  a sub-resource still draws its parent, greyed, so the hierarchy never breaks.
+- **Each resource is a link.** `#/<module>/<Name>` — `#/webservices.rest/Patient` — so a resource
+  can be bookmarked or pasted into a ticket.
+- **Sub-resource nesting is derived, not configured.** `MainSubResourceController` serves every
+  sub-resource as `/{resource}/{parentUuid}/{subResource}`, so the parent is recoverable from the
+  routes. It is resolved by matching the parent segment against the resource that serves it, not by
+  lower-casing — `FormResource` hangs off `Form`, and `UserResource1_8`'s delegate is
+  `UserAndPassword1_8`.
+
+### Why one resource at a time
+
+This is the reason the UI is shaped the way it is. A renderer's dominant cost is **spec ingestion,
+not rendering**: it converts the whole document to its internal structures and resolves every
+`$ref` before anything is interactive, at roughly 4 ms per schema and regardless of how much is on
+screen. Measured on `webservices.rest`:
+
+| Document | KB | Schemas | DOM nodes | Longest task |
+|---|---:|---:|---:|---:|
+| whole module | 969 | 768 | 102 | 2876 ms |
+| one resource (Patient) | 17 | 31 | — | ~500 ms |
+| one resource (Account, emrapi) | 6 | 11 | — | ~330 ms |
+
+The whole-module row displays two collapsed tag rows and 102 DOM nodes and still blocks the main
+thread for nearly three seconds — so it is not rendering, and `JSON.parse` of the same bytes is
+5 ms, so it is not parsing either. No renderer setting turns that work off. A smaller document is
+the only lever, which is what makes per-resource serving a correctness-free performance win: the
+specs are unchanged, only the unit of delivery is smaller.
+
+### Cross-module `$ref` resolution
+
+A dependent module's spec references the REST module's schemas without carrying them, by design:
+
+| Module | Schemas | `$ref`s | Unresolved in its own spec |
+|---|---:|---:|---:|
+| `webservices.rest` | 768 | 671 | 0 |
+| `queue` | 42 | 52 | 15 |
+| `emrapi` | 126 | 130 | 10 |
+| `appointments` | 23 | 23 | 0 |
+
+All 25 resolve in `webservices.rest`. So **no single module's output is enough to render one of its
+own resources**, and the server resolves schema names across every loaded module — the owning
+module's definition wins, then other modules in name order, so the answer never depends on the
+order the modules were passed. Pass every module you want resolved together.
+
+Served with all four loaded, every document resolves completely: `queue` 42 → 97 schemas,
+`emrapi` 126 → 153, and the merged view 895 — **0 dangling `$ref`s** in the slices and in every
+whole-module spec.
+
+`--self-check` is what proves it: on the four modules above it reports 149 resources/controllers,
+149 slices averaging 7 KB, **9 slices pulling 170 schemas from another module, and 0 unresolved
+`$ref`s**. That last number is the one that matters — a slice whose closure stops short renders
+"Could not resolve reference" in place of half its schema, and that failure is invisible when
+spot-checking.
+
+### Other URLs
+
+```
+/index.json                     navigation index — every resource and controller, all modules
+/slices/<module>/<Name>.json    one resource or controller, self-contained
+/specs/<module>/openapi.json    a whole module, cross-module $refs resolved
+/specs/all/openapi.json         every loaded module in one document
+/proxy/*                        reverse proxy to --server
+```
 
 Notes:
 
-- Run `./generate.sh <module-path>...` for the modules first. A module with no generated output is
-  reported as a warning and skipped, not a fatal error.
-- The dev server JAR is built on first run, and rebuilt whenever `openapi-dev-server/src` or its
-  `pom.xml` is newer than the JAR — so an edited dev server never silently serves a stale build.
-- The UI shell loads its renderer from a CDN, so the browser needs network access. Which renderer to
-  standardise on is still open — see *Choosing a renderer* below.
-
-Useful URLs, if you want to fetch a spec rather than read it:
-
-```
-/specs/all/openapi.json           merged spec from all loaded modules
-/specs/<module>/openapi.json      one module
-/specs/<module>/resources/*.json
-/specs/<module>/controllers/*.json
-```
+- Run `./generate.sh <module-path>...` first. A module with no generated output is reported as a
+  warning and skipped, not a fatal error.
+- The JAR is rebuilt when `openapi-dev-server/src/main/java` or its `pom.xml` is newer. The UI's
+  HTML and JS are read from `src/main/resources/web` at request time when that directory is
+  present, so editing the UI needs a browser reload and no rebuild.
+- The renderer bundle is fetched from a CDN on first run and cached under the system temp
+  directory, so subsequent runs work offline. The version is pinned in `RendererAssets.java`.
 
 ## Choosing a renderer
 
-Which renderer to put in front of the specs is not settled. `openapi-dev-server` wires in one current
-pick; the evaluation lives beside it in
-[`openapi-dev-server/renderer-compare/`](openapi-dev-server/renderer-compare/), a small Python
-harness that serves the **same** spec to six renderers side by side — Scalar, Redoc, Stoplight
-Elements, RapiDoc, OpenAPI Explorer, and Swagger UI as the baseline:
+The current renderer is Swagger UI, picked on measurement, not settled by fiat. The evaluation
+lives in [`openapi-dev-server/renderer-compare/`](openapi-dev-server/renderer-compare/), a small
+Python harness that serves the **same** spec to six renderers side by side — Scalar, Redoc,
+Stoplight Elements, RapiDoc, OpenAPI Explorer and Swagger UI:
 
 ```bash
 cd openapi-dev-server/renderer-compare
@@ -198,12 +261,20 @@ cd openapi-dev-server/renderer-compare
 ./run.sh 9400 <openapi-dir>    # ... from another module's generated output
 ```
 
-It also serves a re-tagged copy of the spec alongside the real one, to see what tag hierarchy would
-buy — one tag per resource, grouped under `x-tagGroups`. That copy is a throwaway made by a script;
-the plugin does not emit it.
+It also serves stripped and re-tagged copies of the spec, to separate what a renderer costs from
+what the document costs. Those copies are throwaways made by a script — the plugin does not emit
+them, and only `openapi.json` is a valid description of the API.
 
-The harness's README records what has been observed per renderer, including the finding behind the
-current pick. Read it before swapping the renderer in the dev server.
+The harness's README records what was observed per renderer, including the ingestion finding above
+and the load ladder behind it. Read it before swapping the renderer in the dev server.
+
+One patch travels with Swagger UI: `openapi-dev-server/src/main/resources/web/named-types.js`. Its
+JSON Schema 2020-12 renderer dereferences `$ref`s before rendering and computes the type expression
+from structure alone, so a union of named schemas renders as
+`object | (object | object | object | object)`. The plugin names the branch by reading the `$ref`
+pointer, giving
+`object | (AlertGet_default | AlertGet_full | AlertGet_ref | AlertGet_custom)` — which is what
+matters when the spec is also the input to TypeScript generation.
 
 ## Modules under active test
 
@@ -259,6 +330,7 @@ With no configuration present the integration tests skip rather than fail.
 |---|---|
 | `src/main/java/org/openmrs/plugin/openapi/` | the Maven plugin |
 | `openapi-dev-server/` | standalone dev server behind `serve.sh` (separate build, not part of the plugin) |
+| `openapi-dev-server/src/main/resources/web/` | the docs UI — plain HTML/CSS/JS, no build step, served from disk during development |
 | `openapi-dev-server/renderer-compare/` | side-by-side renderer evaluation harness; plain Python, no build step |
 | `src/test/` | unit tests and the `*SchemaIT` integration tests |
 | `generate.sh` | run the plugin against one or more already-built modules |

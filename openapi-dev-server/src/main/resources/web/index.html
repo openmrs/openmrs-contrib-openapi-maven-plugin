@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OpenMRS API reference</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml">
+<!--
+  The shell: a searchable tree of every resource, sub-resource and controller across every loaded
+  module on the left, one of them rendered on the right.
+
+  Two documents drive it. /index.json is loaded once and holds names only — routes, summaries and
+  property names for everything, ~100KB across the four modules under test. /slices/<module>/<Name>.json
+  is fetched when something is selected and holds that one thing's shapes, ~7KB.
+
+  That split is the design. A renderer's cost is spec ingestion, not rendering: the whole document
+  is converted and every $ref resolved before anything is interactive, so a module-sized spec
+  blocks for seconds no matter how little is on screen. Rendering one resource at a time makes that
+  cost proportional to what you asked for — but only works if you can still find things across
+  every module, which is what the index is for.
+-->
+<style>
+ :root {
+   --fg: #1b1b1b; --muted: #6a6a6a; --line: #e4e4e4; --accent: #0b6bcb;
+   --hit: #fff3b0; --sel: #eaf2fd; --panel: #fafafa;
+ }
+ * { box-sizing: border-box; }
+ body { margin: 0; font-family: system-ui, -apple-system, sans-serif; color: var(--fg);
+        display: flex; height: 100vh; overflow: hidden; }
+
+ /* ---- left pane ---- */
+ #left { width: 380px; min-width: 300px; border-right: 1px solid var(--line);
+         display: flex; flex-direction: column; }
+ #head { padding: 14px 16px 11px; border-bottom: 1px solid var(--line); }
+ h1 { font-size: 13px; margin: 0 0 10px; text-transform: uppercase; letter-spacing: .8px;
+      color: var(--muted); font-weight: 600; }
+ #q { width: 100%; padding: 9px 11px; font-size: 14px; border: 1px solid #ccc; border-radius: 5px;
+      font-family: inherit; }
+ #q:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px rgba(11,107,203,.13); }
+ #stats { font-size: 11.5px; color: var(--muted); margin-top: 8px; line-height: 1.55; }
+ #tree { overflow-y: auto; flex: 1; padding-bottom: 28px; }
+
+ .group { user-select: none; cursor: pointer; display: flex; align-items: center; gap: 6px; }
+ .module { padding: 9px 14px; font-size: 13px; font-weight: 650;
+           border-bottom: 1px solid var(--line); background: var(--panel); }
+ .kind { padding: 6px 14px 6px 30px; font-size: 11px; text-transform: uppercase;
+         letter-spacing: .6px; color: var(--muted); }
+ .caret { width: 9px; display: inline-block; color: var(--muted); font-size: 9px; }
+ .count { margin-left: auto; font-size: 10.5px; color: var(--muted);
+          font-variant-numeric: tabular-nums; }
+
+ .leaf { padding: 6px 14px 6px 46px; cursor: pointer; border-left: 3px solid transparent;
+         display: flex; align-items: baseline; gap: 6px; }
+ .leaf.nested { padding-left: 66px; }
+ .leaf .body { flex: 1; min-width: 0; }
+ .leaf .twist { width: 9px; font-size: 9px; color: var(--muted); flex: none; margin-left: -13px; }
+ .leaf.context .name { color: var(--muted); font-weight: 400; }
+ .leaf .kids { font-size: 10.5px; color: var(--muted); flex: none; }
+ .leaf:hover { background: #f6f9fd; }
+ .leaf.sel { background: var(--sel); border-left-color: var(--accent); }
+ .leaf .name { font-size: 13px; }
+ .leaf .why { font-size: 10.5px; color: #555; font-family: ui-monospace, monospace; margin-top: 2px;
+              white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+ .leaf .ops { font-size: 10.5px; color: var(--muted); }
+ mark { background: var(--hit); padding: 0 1px; }
+
+ /* ---- right pane ---- */
+ #right { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+ #bar { padding: 9px 16px; border-bottom: 1px solid var(--line); display: flex;
+        align-items: baseline; gap: 10px; background: var(--panel); }
+ #crumb { font-size: 13px; }
+ #crumb .mod { color: var(--muted); }
+ #crumb .sep { color: #bbb; margin: 0 5px; }
+ #crumb .name { font-weight: 600; }
+ #meta { margin-left: auto; font-size: 11px; color: var(--muted);
+         font-family: ui-monospace, monospace; }
+ iframe { flex: 1; width: 100%; border: 0; }
+ .empty { padding: 24px 18px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<div id="left">
+  <div id="head">
+    <h1>OpenMRS API</h1>
+    <input id="q" placeholder="resource, route, or field name…" autocomplete="off" autofocus>
+    <div id="stats">loading index…</div>
+  </div>
+  <div id="tree"></div>
+</div>
+
+<div id="right">
+  <div id="bar">
+    <div id="crumb">Select a resource</div>
+    <div id="meta"></div>
+  </div>
+  <iframe id="frame" title="API reference"></iframe>
+</div>
+
+<script>
+const el = (id) => document.getElementById(id);
+
+// Three buckets, not two. A sub-resource has no separate kind in the index — the plugin documents
+// it as a resource, because that is what it is — so the tree splits on the presence of the derived
+// parent link instead.
+const bucketOf = (e) => e.k === 'controller' ? 'controller' : (e.sub ? 'subresource' : 'resource');
+
+let INDEX = [], BY_MODULE = new Map(), selected = null, renderStart = 0;
+// Collapsed by default: the point of the tree is that you see modules first, not 149 rows. A
+// search expands whatever it matched without disturbing what was opened by hand.
+const open = new Set();
+
+const esc = (s) => String(s).replace(/[&<>"]/g, c =>
+  ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+const mark = (s, q) => {
+  s = String(s);
+  if (!q) { return esc(s); }
+  const i = s.toLowerCase().indexOf(q);
+  return i < 0 ? esc(s)
+    : esc(s.slice(0, i)) + '<mark>' + esc(s.slice(i, i + q.length)) + '</mark>'
+      + esc(s.slice(i + q.length));
+};
+
+// Exact and prefix name matches outrank incidental field hits, so "patient" leads with the Patient
+// resource rather than the dozen resources that merely have a patient field.
+function score(e, q) {
+  const name = e.n.toLowerCase();
+  if (name === q) { return { s: 100, why: '' }; }
+  if (name.startsWith(q)) { return { s: 80, why: '' }; }
+  if (name.includes(q)) { return { s: 60, why: '' }; }
+  const route = e.o.find(o => o.p.toLowerCase().includes(q));
+  if (route) { return { s: 50, why: route.v.toUpperCase() + ' ' + route.p }; }
+  const summary = e.o.find(o => (o.s || '').toLowerCase().includes(q));
+  if (summary) { return { s: 40, why: summary.s }; }
+  const field = e.f.find(f => f.toLowerCase().includes(q));
+  if (field) { return { s: 30, why: 'field: ' + field }; }
+  return null;
+}
+
+function render(rawQuery) {
+  const t0 = performance.now();
+  const q = (rawQuery || '').trim().toLowerCase();
+
+  const matched = new Map();   // module -> bucket -> [{e, why, s}]
+  let total = 0;
+  for (const [module, entries] of BY_MODULE) {
+    for (const e of entries) {
+      const hit = q ? score(e, q) : { s: 0, why: '' };
+      if (!hit) { continue; }
+      total++;
+      if (!matched.has(module)) { matched.set(module, new Map()); }
+      const byKind = matched.get(module);
+      const bucket = bucketOf(e);
+      if (!byKind.has(bucket)) { byKind.set(bucket, []); }
+      byKind.get(bucket).push({ e, why: hit.why, s: hit.s });
+    }
+  }
+
+  const byName = (a, b) => b.s - a.s || a.e.n.localeCompare(b.e.n);
+  let html = '';
+
+  for (const module of [...matched.keys()].sort()) {
+    const byKind = matched.get(module);
+    const moduleCount = [...byKind.values()].reduce((a, v) => a + v.length, 0);
+    // While searching, a module with hits is expanded regardless of its manual state.
+    const moduleOpen = q ? true : open.has(module);
+    html += `<div class="group module" data-node="${esc(module)}">
+               <span class="caret">${moduleOpen ? '▾' : '▸'}</span>${esc(module)}
+               <span class="count">${moduleCount}</span></div>`;
+    if (!moduleOpen) { continue; }
+
+    const leafHtml = (row, opts) => {
+      const { e, why } = row;
+      const o = opts || {};
+      const isSel = selected && selected.m === e.m && selected.n === e.n;
+      const detail = why
+        ? `<div class="why">${mark(why, q)}</div>`
+        : `<div class="ops">${e.o.length} operation${e.o.length === 1 ? '' : 's'} · ${e.f.length} fields</div>`;
+      // The twisty is its own click target — the rest of the row selects the resource, so a parent
+      // stays openable without having to load it first.
+      const twist = o.hasKids
+        ? `<span class="twist" data-twist="${esc(o.node)}">${o.open ? '▾' : '▸'}</span>`
+        : (o.nested ? '' : '<span class="twist"></span>');
+      return `<div class="leaf${o.nested ? ' nested' : ''}${o.context ? ' context' : ''}${isSel ? ' sel' : ''}"
+                   data-m="${esc(e.m)}" data-n="${esc(e.n)}">
+                ${twist}
+                <div class="body"><div class="name">${mark(e.n, q)}</div>${detail}</div>
+                ${o.kidCount ? `<span class="kids">${o.kidCount}</span>` : ''}
+              </div>`;
+    };
+
+    const resources = byKind.get('resource') || [];
+    const subs = byKind.get('subresource') || [];
+    const controllers = (byKind.get('controller') || []).sort(byName);
+
+    // Children keyed by parent name. A parent that did not match itself is still drawn, as
+    // context, so searching "identifier" shows Patient > PatientIdentifier rather than an orphan.
+    const kids = new Map();
+    for (const row of subs) {
+      if (!kids.has(row.e.sub)) { kids.set(row.e.sub, []); }
+      kids.get(row.e.sub).push(row);
+    }
+    const parentRows = new Map(resources.map(r => [r.e.n, r]));
+    for (const parentName of kids.keys()) {
+      if (parentRows.has(parentName)) { continue; }
+      const entry = (BY_MODULE.get(module) || []).find(e => e.n === parentName);
+      if (entry) { parentRows.set(parentName, { e: entry, why: '', s: -1, context: true }); }
+    }
+
+    if (parentRows.size) {
+      const node = module + '/resources';
+      const isOpen = q ? true : open.has(node);
+      html += `<div class="group kind" data-node="${esc(node)}">
+                 <span class="caret">${isOpen ? '▾' : '▸'}</span>Resources
+                 <span class="count">${resources.length + subs.length}</span></div>`;
+      if (isOpen) {
+        for (const row of [...parentRows.values()].sort(byName)) {
+          const children = (kids.get(row.e.n) || []).sort(byName);
+          const kidNode = module + '/r/' + row.e.n;
+          // While searching, a parent with matching children is open so the hit is visible.
+          const kidsOpen = (q && children.length) ? true : open.has(kidNode);
+          html += leafHtml(row, {
+            hasKids: children.length > 0, open: kidsOpen, node: kidNode,
+            context: row.context, kidCount: children.length || 0
+          });
+          if (kidsOpen) { html += children.map(c => leafHtml(c, { nested: true })).join(''); }
+        }
+      }
+    }
+
+    if (controllers.length) {
+      const node = module + '/controllers';
+      const isOpen = q ? true : open.has(node);
+      html += `<div class="group kind" data-node="${esc(node)}">
+                 <span class="caret">${isOpen ? '▾' : '▸'}</span>Controllers
+                 <span class="count">${controllers.length}</span></div>`;
+      if (isOpen) { html += controllers.map(r => leafHtml(r, {})).join(''); }
+    }
+  }
+
+  el('tree').innerHTML = html || '<div class="empty">No match.</div>';
+
+  const ms = (performance.now() - t0).toFixed(1);
+  el('stats').innerHTML = q
+    ? `<b>${total}</b> of ${INDEX.length} across ${matched.size} module${matched.size === 1 ? '' : 's'} · ${ms} ms`
+    : `${INDEX.length} resources and controllers across ${BY_MODULE.size} modules`;
+
+  document.querySelectorAll('.group').forEach(g => g.onclick = () => toggle(g.dataset.node));
+  document.querySelectorAll('.twist[data-twist]').forEach(t => t.onclick = (ev) => {
+    ev.stopPropagation();
+    toggle(t.dataset.twist);
+  });
+  document.querySelectorAll('.leaf').forEach(l => l.onclick = () => {
+    // Route through the hash so every selection is linkable and survives a reload.
+    location.hash = '#/' + encodeURIComponent(l.dataset.m) + '/' + encodeURIComponent(l.dataset.n);
+  });
+}
+
+function toggle(node) {
+  // Clicking a group while a search is active pins that node to browse mode.
+  open.has(node) ? open.delete(node) : open.add(node);
+  render(el('q').value);
+}
+
+function select(module, name) {
+  const entry = (BY_MODULE.get(module) || []).find(e => e.n === name);
+  if (!entry) {
+    el('crumb').textContent = `Unknown: ${module} / ${name}`;
+    return;
+  }
+  selected = { m: module, n: name };
+
+  // Open the branch the selection lives on, so a link straight to a sub-resource lands with its
+  // parent expanded rather than in a collapsed tree.
+  open.add(module);
+  open.add(module + '/' + (entry.k === 'controller' ? 'controllers' : 'resources'));
+  if (entry.sub) { open.add(module + '/r/' + entry.sub); }
+  render(el('q').value);
+  const row = document.querySelector('.leaf.sel');
+  if (row) { row.scrollIntoView({ block: 'nearest' }); }
+
+  el('crumb').innerHTML =
+    `<span class="mod">${esc(module)}</span><span class="sep">/</span>`
+    + (entry.sub ? `<span class="mod">${esc(entry.sub)}</span><span class="sep">/</span>` : '')
+    + `<span class="name">${esc(name)}</span>`;
+
+  const spec = `/slices/${encodeURIComponent(module)}/${encodeURIComponent(name)}.json`;
+  el('meta').textContent = 'loading…';
+  renderStart = performance.now();
+  el('frame').src = `viewer.html?spec=${encodeURIComponent(spec)}`;
+
+  fetch(spec).then(r => r.text()).then(text => {
+    const doc = JSON.parse(text);
+    const schemas = Object.keys((doc.components || {}).schemas || {}).length;
+    el('meta').dataset.size = `${(text.length / 1024).toFixed(1)} KB · ${schemas} schemas`;
+  });
+}
+
+// Called by the frame when the renderer finishes, so the timing covers ingestion rather than just
+// the network fetch — ingestion is the part that costs, and the part slicing exists to bound.
+window.specRendered = function () {
+  const ms = Math.round(performance.now() - renderStart);
+  const size = el('meta').dataset.size || '';
+  el('meta').textContent = size ? `${size} · ${ms} ms` : `${ms} ms`;
+};
+
+function fromHash() {
+  const match = location.hash.match(/^#\/([^/]+)\/(.+)$/);
+  if (match) {
+    select(decodeURIComponent(match[1]), decodeURIComponent(match[2]));
+  }
+}
+
+const t0 = performance.now();
+fetch('/index.json').then(r => r.text()).then(text => {
+  const tParse = performance.now();
+  INDEX = JSON.parse(text);
+  const parseMs = (performance.now() - tParse).toFixed(1);
+  for (const e of INDEX) {
+    if (!BY_MODULE.has(e.m)) { BY_MODULE.set(e.m, []); }
+    BY_MODULE.get(e.m).push(e);
+  }
+  render('');
+  el('stats').innerHTML +=
+    `<br>index ${(text.length / 1024).toFixed(0)} KB · parsed in ${parseMs} ms · ready in ${Math.round(performance.now() - t0)} ms`;
+  fromHash();
+}).catch(err => {
+  el('stats').textContent = 'Could not load the index: ' + err;
+});
+
+window.addEventListener('hashchange', fromHash);
+el('q').addEventListener('input', e => render(e.target.value));
+// Enter jumps to the best match, so a search can be driven without leaving the keyboard.
+//
+// Scored across every module rather than taken from the first row in the tree: the tree groups by
+// module in alphabetical order, so its first row is the best hit *in the alphabetically first
+// module that matched at all* — searching "conceptname" landed on emrapi/DiagnosisController,
+// which matched on a field, while webservices.rest/ConceptName was an exact name match further
+// down.
+el('q').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') { return; }
+  const q = el('q').value.trim().toLowerCase();
+  if (!q) { return; }
+  let best = null;
+  for (const entry of INDEX) {
+    const hit = score(entry, q);
+    if (!hit) { continue; }
+    if (!best || hit.s > best.s || (hit.s === best.s && entry.n.localeCompare(best.e.n) < 0)) {
+      best = { e: entry, s: hit.s };
+    }
+  }
+  if (best) {
+    location.hash = '#/' + encodeURIComponent(best.e.m) + '/' + encodeURIComponent(best.e.n);
+  }
+});
+</script>
+</body>
+</html>
