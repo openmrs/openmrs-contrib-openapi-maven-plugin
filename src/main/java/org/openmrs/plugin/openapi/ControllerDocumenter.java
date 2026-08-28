@@ -167,6 +167,11 @@ public class ControllerDocumenter {
             }
             documented++;
 
+            // Titled before serialising: the per-controller file is written below, ahead of the
+            // openapi.json pass in OpenApiSpecGenerator, and without this the same schema would
+            // carry a title in openapi.json but not in the controller's own file.
+            Schemas.titleAll(controllerSchemas);
+
             // Merge controller DTO schemas into the main openapi.json components.
             // Never overwrite existing resource $ref placeholders.
             for (Map.Entry<String, Schema<?>> e : controllerSchemas.entrySet()) {

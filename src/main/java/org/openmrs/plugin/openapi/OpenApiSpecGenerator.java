@@ -185,6 +185,7 @@ public class OpenApiSpecGenerator {
 
             // Write per-resource file: { "schemas": {...}, "paths": {...} }
             Schemas.normalizeAll(resourceComponents.getSchemas());
+            Schemas.titleAll(resourceComponents.getSchemas());
             com.fasterxml.jackson.databind.node.ObjectNode root = swaggerMapper.createObjectNode();
             com.fasterxml.jackson.databind.JsonNode componentsJson = swaggerMapper.valueToTree(resourceComponents);
             if (componentsJson.has("schemas")) {
@@ -248,6 +249,8 @@ public class OpenApiSpecGenerator {
         // set independently — reconcile them across the finished document before serialising.
         Schemas.normalizeAll(openAPI.getComponents() != null ? openAPI.getComponents().getSchemas() : null);
         Schemas.normalizeAll(pathSchemas(openAPI));
+        // Named schemas only — pathSchemas() is deliberately excluded, see Schemas.titleAll.
+        Schemas.titleAll(openAPI.getComponents() != null ? openAPI.getComponents().getSchemas() : null);
 
         // write the final OpenAPI file
         Path openApiOut = Paths.get(outputDir, outputFile);

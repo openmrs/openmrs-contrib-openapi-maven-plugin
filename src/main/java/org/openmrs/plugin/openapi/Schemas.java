@@ -100,6 +100,41 @@ final class Schemas {
         }
     }
 
+    /**
+     * Gives every named schema a {@code title} equal to its own key.
+     * <p>
+     * Renderers of an OpenAPI 3.1 document have no other way to name the branches of a union.
+     * Swagger UI's JSON Schema 2020-12 renderer labels each {@code anyOf} branch
+     * {@code `#${index} ${getTitle(schema)}`}, and its {@code getTitle} reads {@code title}, then
+     * {@code $anchor}, then {@code $id} — none of which the generated schemas carried, so
+     * {@code AlertGet} rendered as {@code #0 #1 #2 #3} rather than naming
+     * {@code AlertGet_default} and friends. Verified in a browser against Swagger UI 5.32.14:
+     * adding {@code title} is the whole fix, no renderer patch involved.
+     * <p>
+     * {@code title} rather than {@code $anchor} or {@code $id} because it is plain JSON Schema that
+     * every renderer and most code generators already read, and it carries no resolution semantics
+     * — {@code $id} would change how sibling {@code $ref}s resolve.
+     * <p>
+     * The title is always the schema's own key, so a generator that names models from {@code title}
+     * produces exactly the names it would have produced from the keys. An explicit title survives:
+     * only a null one is filled in, which leaves {@code @Schema(title = ...)} on a resource method
+     * in control.
+     * <p>
+     * Named schemas only. Inline schemas inside {@code paths} have no key to take a title from, and
+     * titling them would put a label on shapes that are not types.
+     */
+    static void titleAll(java.util.Map<String, ? extends Schema> schemas) {
+        if (schemas == null) {
+            return;
+        }
+        for (java.util.Map.Entry<String, ? extends Schema> entry : schemas.entrySet()) {
+            Schema<?> schema = entry.getValue();
+            if (schema != null && schema.getTitle() == null) {
+                schema.setTitle(entry.getKey());
+            }
+        }
+    }
+
     private static <S extends Schema<?>> S withType(S schema, String type) {
         schema.specVersion(SpecVersion.V31);
         schema.setType(type);
