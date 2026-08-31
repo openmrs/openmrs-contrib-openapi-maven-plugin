@@ -20,12 +20,24 @@ import java.net.URLClassLoader;
 import java.util.ArrayList;
 import java.util.List;
 
+/**
+ * The {@code generate} goal: OpenAPI specs for the module's REST resources and controllers, then a
+ * TypeScript client package built from those specs.
+ * <p>
+ * The two halves were once two goals. They are one now because the second is worthless without the
+ * first — it reads nothing but the files the first writes — and splitting them made every caller
+ * responsible for running them in order. What the split really bought was a way to <em>skip</em>
+ * the TypeScript half, and {@link #generateTypeScript} buys that for one parameter.
+ * <p>
+ * They still run under different classloaders; see {@link TypeScriptClientGenerator} for why the
+ * ordering in {@link #execute()} is load bearing.
+ */
 @Mojo(name = "generate",
       defaultPhase = LifecyclePhase.PROCESS_CLASSES,
       requiresDependencyResolution = ResolutionScope.TEST)
-public class OpenAPISpecGeneratorMojo extends AbstractMojo {
+public class GenerateMojo extends AbstractMojo {
 
-    private static final Logger log = LoggerFactory.getLogger(OpenAPISpecGeneratorMojo.class);
+    private static final Logger log = LoggerFactory.getLogger(GenerateMojo.class);
 
     /**
      * The generator is loaded by name rather than as a class literal: referencing
@@ -36,10 +48,37 @@ public class OpenAPISpecGeneratorMojo extends AbstractMojo {
      * package is renamed — a hardcoded literal silently broke when it was.
      */
     private static final String GENERATOR_CLASS_NAME =
-            OpenAPISpecGeneratorMojo.class.getPackage().getName() + ".OpenApiSpecGenerator";
+            GenerateMojo.class.getPackage().getName() + ".OpenApiSpecGenerator";
 
     @Parameter(defaultValue = "${project}", required = true, readonly = true)
     private MavenProject project;
+
+    /**
+     * Whether to also emit the TypeScript client package.
+     * <p>
+     * Defaults to <b>on</b>, which is the opposite of how the old separate goal behaved. A module
+     * that does not want the package turns it off in its own {@code <configuration>}; the default
+     * has to serve the caller that cannot configure anything, and that is the common one —
+     * {@code generate.sh} invokes this goal by fully-qualified coordinates against modules that
+     * declare no {@code <plugin>} block at all, so it has no way to turn the flag <em>on</em>.
+     */
+    @Parameter
+    private boolean generateTypeScript = true;
+
+    /**
+     * npm package name for the generated client. Defaults to {@code @openmrs/<artifactId>}, with
+     * dots replaced by hyphens — {@code webservices.rest-omod} →
+     * {@code @openmrs/webservices-rest-omod}.
+     */
+    @Parameter
+    private String npmName;
+
+    /**
+     * Registry URL written to the package's {@code publishConfig}, for publishing somewhere other
+     * than npmjs. Optional; omitted entirely when unset.
+     */
+    @Parameter
+    private String npmRepository;
 
     /**
      * Specs are generated directly into the module's compiled-resources directory, so the
@@ -72,6 +111,19 @@ public class OpenAPISpecGeneratorMojo extends AbstractMojo {
         runGeneratorDirectly();
 
         verifyOutput();
+
+        // Strictly after runGeneratorDirectly() — which closes its two URLClassLoaders and restores
+        // the context classloader in a finally block — because openapi-generator must run in the
+        // plugin's own ClassRealm, not the one built to load module classes.
+        //
+        // And strictly after verifyOutput(), so the specs are reported as written even when this
+        // step throws. It can: an operationId collision is fatal. Under the old two-goal split that
+        // failure could not touch the specs at all, since they were already on disk from a separate
+        // invocation; keeping the order preserves that.
+        if (generateTypeScript) {
+            new TypeScriptClientGenerator(project, new File(getOutputDirectory()).toPath(),
+                    npmName, npmRepository, externalSchemaArtifacts, getLog()).generate();
+        }
 
         log.info("Representation analysis completed successfully");
         log.info("==============================");
@@ -262,6 +314,14 @@ public class OpenAPISpecGeneratorMojo extends AbstractMojo {
                             project.getVersion());
             generatorClass.getMethod("generateOpenAPISpec", String.class, String.class).invoke(generator, getOutputDirectory(), getOutputFileName());
 
+            // Read before the finally block closes the loaders. Map/String are system-classloader
+            // types, so this crosses the realm boundary cleanly — the same reason setup() takes
+            // Strings.
+            @SuppressWarnings("unchecked")
+            java.util.Map<String, String> owners = (java.util.Map<String, String>)
+                    generatorClass.getMethod("getExternalSchemaOwners").invoke(generator);
+            externalSchemaArtifacts = toArtifactCoordinates(owners);
+
         } catch (ClassNotFoundException e) {
             throw new MojoExecutionException("Could not load " + GENERATOR_CLASS_NAME
                     + " from the generator classloader. The plugin JAR on the classpath is probably "
@@ -276,6 +336,55 @@ public class OpenAPISpecGeneratorMojo extends AbstractMojo {
             try { generatorCL.close(); } catch (IOException e) { log.warn("Failed to close generator CL: {}", e.getMessage()); }
             try { moduleCL.close(); } catch (IOException e) { log.warn("Failed to close module CL: {}", e.getMessage()); }
         }
+    }
+
+    /**
+     * Schema name -> the Maven artifact of the module that defines it, for schemas this module's
+     * document references but does not define. Populated by {@link #runGeneratorDirectly()}.
+     */
+    private java.util.Map<String, org.apache.maven.artifact.Artifact> externalSchemaArtifacts =
+            java.util.Collections.emptyMap();
+
+    /**
+     * Turns the generator's "this schema came from that JAR" answer into "this schema came from
+     * that Maven artifact".
+     * <p>
+     * The split is deliberate. Inside the isolated classloader all that is knowable is a
+     * {@code CodeSource} — a path on disk. Only the mojo has the resolved dependency set that says
+     * which artifact that path is, and therefore its version, which is what a generated npm
+     * dependency has to declare. {@code ResolutionScope.TEST} covers {@code provided}, which is how
+     * every OpenMRS module depends on every other.
+     */
+    private java.util.Map<String, org.apache.maven.artifact.Artifact> toArtifactCoordinates(
+            java.util.Map<String, String> ownersByJarPath) {
+        if (ownersByJarPath == null || ownersByJarPath.isEmpty()) {
+            return java.util.Collections.emptyMap();
+        }
+        java.util.Map<String, org.apache.maven.artifact.Artifact> byPath = new java.util.HashMap<>();
+        for (org.apache.maven.artifact.Artifact artifact
+                : (java.util.Set<org.apache.maven.artifact.Artifact>) project.getArtifacts()) {
+            if (artifact.getFile() != null) {
+                try {
+                    byPath.put(artifact.getFile().getCanonicalPath(), artifact);
+                } catch (IOException e) {
+                    log.debug("Could not canonicalise {}", artifact.getFile());
+                }
+            }
+        }
+
+        java.util.Map<String, org.apache.maven.artifact.Artifact> resolved = new java.util.TreeMap<>();
+        for (java.util.Map.Entry<String, String> entry : ownersByJarPath.entrySet()) {
+            org.apache.maven.artifact.Artifact artifact = byPath.get(entry.getValue());
+            if (artifact != null) {
+                resolved.put(entry.getKey(), artifact);
+            } else {
+                // A location that is on the classpath but is not a resolved dependency — the
+                // module's own output, or a JAR added by hand. Nothing to depend on, so it is left
+                // out rather than guessed at.
+                log.debug("No artifact for {} (owner of {})", entry.getValue(), entry.getKey());
+            }
+        }
+        return resolved;
     }
 
     /** Warns if generation did not produce the spec, listing whatever did land instead. */

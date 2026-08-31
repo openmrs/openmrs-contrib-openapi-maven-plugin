@@ -55,7 +55,7 @@ class LocationSchemaIT {
 
     @BeforeAll
     static void setup() throws Exception {
-        schemas = SchemaLoader.loadRepresentationSchemas(OpenMrsExtension.SCHEMAS_DIR, "Location.json");
+        schemas = SchemaLoader.loadRepresentationSchemas(OpenMrsExtension.SCHEMAS_DIR, "LocationResource2_0.json");
 
         Map<String, PathItem> paths = SchemaLoader.loadResourcePaths(
                 OpenMrsExtension.SCHEMAS_DIR, "location");

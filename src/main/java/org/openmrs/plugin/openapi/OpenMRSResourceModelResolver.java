@@ -70,6 +70,17 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
   /** Domain class -> the name of the resource documenting it. @see #registerResourceNames */
   private static final Map<Class<?>, String> RESOURCE_NAME_BY_SUPPORTED_CLASS = new LinkedHashMap<>();
 
+  /**
+   * Resource name -> the handler class documenting it, kept only so a schema name can be traced
+   * back to the JAR it came from. @see #ownerLocationForSchema
+   */
+  private static final Map<String, Class<?>> HANDLER_CLASS_BY_RESOURCE_NAME = new LinkedHashMap<>();
+
+  /**
+   * Resource name -> the file its schemas are written to. @see #fileNameFor
+   */
+  private static final Map<String, String> FILE_NAME_BY_RESOURCE_NAME = new LinkedHashMap<>();
+
   /** Subclass-handled domain class -> its parent resource name, and -> its subtype name. */
   private static final Map<Class<?>, String> PARENT_BY_SUBCLASS = new LinkedHashMap<>();
 
@@ -1055,20 +1066,112 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
    * {@code DrugOrder} to {@code Order} — where it can be pinned further to that subtype's variant.
    */
   public static String getResourceSpecFilename(Type delegateType, Representation rep) {
+    String[] target = refTargetFor(delegateType, rep);
+    return target == null ? null : "./" + target[0] + ".json#/schemas/" + target[1];
+  }
+
+  /**
+   * The schema name a {@code $ref} should target for a domain class, or null when no resource
+   * documents it.
+   * <p>
+   * The same lookup as {@link #getResourceSpecFilename}, but yielding a bare name for the single
+   * flat {@code components/schemas} namespace rather than a path into a per-resource file. That is
+   * what {@code ControllerDocumenter} needs: controller specs are self-contained documents whose
+   * every {@code $ref} is {@code #/components/schemas/...}, so they cannot use the cross-file form.
+   * <p>
+   * The name may well not be defined in the document that emits it — a controller in a dependent
+   * module refers to {@code ConceptGet_ref}, which only {@code webservices.rest} defines. That is
+   * the same cross-module dangling ref the resource half already emits (emrapi's own
+   * {@code openapi.json} carries ten of them), resolved by a catalog across installed modules.
+   */
+  public static String componentSchemaNameForResource(Type delegateType, Representation rep) {
+    String[] target = refTargetFor(delegateType, rep);
+    return target == null ? null : target[1];
+  }
+
+  /**
+   * The canonical path of the JAR or directory the resource behind a schema name was loaded from,
+   * or null when no resource claims that name.
+   * <p>
+   * This is how a cross-module {@code $ref} is traced to the module that owns it. Every schema this
+   * plugin names for a resource is {@code <ResourceName>Get_<rep>} — optionally with a
+   * {@code _<subtype>} suffix — so the resource name is the part before {@code Get_}, and its
+   * handler's {@code CodeSource} is the artifact. The caller turns that path into Maven
+   * coordinates; it cannot be done here, because this runs in the isolated classloader and has no
+   * {@code MavenProject}.
+   * <p>
+   * Names that are not resource schemas at all — a controller DTO, or anything hand-built — do not
+   * match a registered resource and come back null, which is the right answer: they are not
+   * published by another module either.
+   */
+  public static String ownerLocationForSchema(String schemaName) {
+    int marker = schemaName == null ? -1 : schemaName.indexOf("Get_");
+    if (marker <= 0) {
+      return null;
+    }
+    Class<?> handler = HANDLER_CLASS_BY_RESOURCE_NAME.get(schemaName.substring(0, marker));
+    if (handler == null) {
+      return null;
+    }
+    try {
+      java.security.CodeSource source = handler.getProtectionDomain().getCodeSource();
+      if (source == null || source.getLocation() == null) {
+        return null;
+      }
+      return new java.io.File(source.getLocation().toURI()).getCanonicalPath();
+    } catch (Exception e) {
+      return null;
+    }
+  }
+
+  /**
+   * {@code {owning resource name, schema name}} for a domain class, or null when no resource
+   * documents it. The two differ for a subclass-handled class: {@code DrugOrder} is documented by
+   * the {@code Order} resource as its {@code drugorder} variant.
+   */
+  private static String[] refTargetFor(Type delegateType, Representation rep) {
     Class<?> rawClass = TypeFactory.rawClass(delegateType);
 
     String variant = VARIANT_BY_SUBCLASS.get(rawClass);
     if (variant != null) {
       String parent = PARENT_BY_SUBCLASS.get(rawClass);
-      return "./" + parent + ".json#/schemas/" + parent + "Get_" + rep.getRepresentation()
-          + "_" + variant;
+      // The subtype is documented inside its parent's file, so the file name is the parent's —
+      // and it must go through the same registry as the branch below. Deriving one and not the
+      // other is how a DrugOrder-typed property ends up pointing at ./Order.json, a file that no
+      // longer exists: a dangling ref that nothing fails on.
+      return new String[] { fileNameFor(parent),
+          parent + "Get_" + rep.getRepresentation() + "_" + variant };
     }
 
     String resourceName = resourceNameFor(rawClass);
     if (resourceName == null) {
       return null;
     }
-    return "./" + resourceName + ".json#/schemas/" + resourceName + "Get_" + rep.getRepresentation();
+    return new String[] { fileNameFor(resourceName),
+        resourceName + "Get_" + rep.getRepresentation() };
+  }
+
+  /**
+   * The file {@code resources/} holds a resource's schemas in: its handler's simple class name.
+   * <p>
+   * Deliberately not the resource name. The two answer different questions — {@code PatientGet_ref}
+   * is the shape of a patient, while {@code PatientResource1_9.json} says which Java class produced
+   * it, version marker included. A reader who wants to check a schema against the code needs the
+   * second, and the resource name does not carry it: 21 of 111 regular resources have a delegate
+   * whose name differs from their own, and several resources are served by one of half a dozen
+   * version-gated handler classes.
+   * <p>
+   * Falls back to the resource name for a resource that was never registered, which keeps a
+   * {@code $ref} pointing somewhere rather than at null.
+   */
+  static String fileNameFor(String resourceName) {
+    String fileName = FILE_NAME_BY_RESOURCE_NAME.get(resourceName);
+    return fileName != null ? fileName : resourceName;
+  }
+
+  /** The file name for a handler, used when writing {@code resources/<file>.json}. */
+  public static String getResourceFileName(DelegatingResourceHandler<?> handler) {
+    return handler.getClass().getSimpleName();
   }
 
   /** @see RestServiceImpl#getResourceBySupportedClass */
@@ -1112,6 +1215,8 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
   public static void registerResourceNames(List<DelegatingResourceHandler<?>> handlers,
       Map<DelegatingResourceHandler<?>, List<DelegatingSubclassHandler<?, ?>>> subclassHandlers) {
     RESOURCE_NAME_BY_SUPPORTED_CLASS.clear();
+    HANDLER_CLASS_BY_RESOURCE_NAME.clear();
+    FILE_NAME_BY_RESOURCE_NAME.clear();
     PARENT_BY_SUBCLASS.clear();
     VARIANT_BY_SUBCLASS.clear();
 
@@ -1120,6 +1225,12 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
       if (supported != null && !RESOURCE_NAME_BY_SUPPORTED_CLASS.containsKey(supported)) {
         RESOURCE_NAME_BY_SUPPORTED_CLASS.put(supported, getResourceName(handler));
       }
+      // Keyed by resource name rather than supported class, because that is the half of the schema
+      // name a $ref carries: ConceptGet_ref names the Concept resource, and its handler is what
+      // says which JAR — and therefore which module — the schema would come from.
+      HANDLER_CLASS_BY_RESOURCE_NAME.putIfAbsent(getResourceName(handler), handler.getClass());
+      FILE_NAME_BY_RESOURCE_NAME.putIfAbsent(getResourceName(handler),
+          getResourceFileName(handler));
     }
     for (Map.Entry<DelegatingResourceHandler<?>, List<DelegatingSubclassHandler<?, ?>>> entry
         : subclassHandlers.entrySet()) {
@@ -1179,6 +1290,32 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
       return handler.getClass().getAnnotation(
           org.openmrs.module.webservices.rest.web.annotation.SubResource.class);
   }
+
+  /**
+   * The tag a resource's operations carry, which is also what a generator would name its API class
+   * after. Only a trailing REST-version marker is removed:
+   * {@code EncounterResource1_8} → {@code EncounterResource}.
+   * <p>
+   * Deliberately <b>not</b> {@link #getResourceName}, which strips {@code Resource} too. That name
+   * is load-bearing elsewhere — it names every {@code <Resource>Get_default} schema and every
+   * cross-resource {@code $ref} — so it cannot
+   * change. But as a tag it let a resource collide with a <em>controller</em> of the same name
+   * ({@code HL7Message} was claimed by both the resource and {@code HL7MessageController1_8}), and
+   * then the two shared a docs group and would share a generated client class. Keeping both
+   * suffixes makes that structurally impossible and says which half of the API a group came from.
+   * <p>
+   * Mirrors {@code ControllerDocumenter.apiTagFor}; the two rules should stay the same shape.
+   */
+  public static String getResourceApiTag(DelegatingResourceHandler<?> handler) {
+      return RESOURCE_VERSION_SUFFIX.matcher(handler.getClass().getSimpleName()).replaceFirst("");
+  }
+
+  /**
+   * A trailing REST-version marker, but only where it follows the word {@code Resource}, so digits
+   * that are part of a name are left alone.
+   */
+  private static final Pattern RESOURCE_VERSION_SUFFIX =
+      Pattern.compile("(?<=Resource)\\d+(?:_\\d+)*$");
 
   private static String stripResourceSuffix(String className) {
       Matcher matcher = RESOURCE_SUFFIX.matcher(className);

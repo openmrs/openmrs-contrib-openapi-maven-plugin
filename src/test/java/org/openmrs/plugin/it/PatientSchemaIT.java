@@ -35,7 +35,7 @@ class PatientSchemaIT {
 
     @BeforeAll
     static void setup() throws Exception {
-        schemas = SchemaLoader.loadRepresentationSchemas(OpenMrsExtension.SCHEMAS_DIR, "Patient.json");
+        schemas = SchemaLoader.loadRepresentationSchemas(OpenMrsExtension.SCHEMAS_DIR, "PatientResource1_9.json");
         patientUuid = fetchFirstPatientUuid();
     }
 

@@ -1,9 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --) shift; break ;;
+        -*) echo "Unknown option: $1" >&2; exit 1 ;;
+        *) break ;;
+    esac
+done
+
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <module-path> [<module-path> ...]" >&2
     echo "  e.g. $0 ../openmrs-module-webservices.rest ../openmrs-module-queue" >&2
+    echo "" >&2
+    echo "Writes the OpenAPI specs to <module>/omod/target/classes/META-INF/openapi and an" >&2
+    echo "npm package of TypeScript clients for the module's controller endpoints to" >&2
+    echo "<module>/omod/target/generated-typescript." >&2
     echo "" >&2
     echo "Each module must already be built, and this plugin must be installed" >&2
     echo "(mvn clean install). Set JAVA_HOME to the JDK you want Maven to use;" >&2
@@ -96,6 +108,11 @@ generate_for_module() {
     fi
     if [ -d "$output_dir/controllers" ]; then
         echo "  controllers/     $(find "$output_dir/controllers" -name '*.json' | wc -l) controller files"
+    fi
+    local package_dir="$(dirname "$target_classes")/generated-typescript"
+    if [ -d "$package_dir" ]; then
+        echo "  typescript/      $(find "$package_dir/src" -name '*.ts' | wc -l) source files"
+        echo "npm package: $package_dir"
     fi
     echo "Full output: $output_dir"
 }

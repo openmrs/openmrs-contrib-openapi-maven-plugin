@@ -25,6 +25,9 @@
         
         <maven.version>3.6.3</maven.version>
         <junit.version>4.13.2</junit.version>
+
+        <!-- Pinned: the emitted TypeScript is part of the plugin's deterministic output. -->
+        <openapi.generator.version>7.11.0</openapi.generator.version>
     </properties>
 
     <dependencyManagement>
@@ -101,6 +104,17 @@
             <groupId>com.fasterxml.jackson.datatype</groupId>
             <artifactId>jackson-datatype-jsr310</artifactId>
             <version>2.13.4</version>
+        </dependency>
+
+        <!--
+            TypeScript client generation. Runs in the plugin's own ClassRealm, never in the
+            isolated generator classloader: it is a pure JSON -> text transform that needs no
+            module classes. isGeneratorJar() must therefore not list any of these artifacts.
+        -->
+        <dependency>
+            <groupId>org.openapitools</groupId>
+            <artifactId>openapi-generator</artifactId>
+            <version>${openapi.generator.version}</version>
         </dependency>
 
         <!-- Integration test dependencies -->

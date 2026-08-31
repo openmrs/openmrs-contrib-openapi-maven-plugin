@@ -35,7 +35,7 @@ class VisitSchemaIT {
 
     @BeforeAll
     static void setup() throws Exception {
-        schemas = SchemaLoader.loadRepresentationSchemas(OpenMrsExtension.SCHEMAS_DIR, "Visit.json");
+        schemas = SchemaLoader.loadRepresentationSchemas(OpenMrsExtension.SCHEMAS_DIR, "VisitResource1_9.json");
         visitUuid = fetchFirstVisitUuid();
     }
 

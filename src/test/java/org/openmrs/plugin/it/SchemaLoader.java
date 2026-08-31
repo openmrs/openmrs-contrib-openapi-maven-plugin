@@ -15,6 +15,7 @@ import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
+import java.util.Iterator;
 import java.util.Map;
 import java.util.Set;
 
@@ -43,16 +44,40 @@ public class SchemaLoader {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /**
+     * The document's root schema — the one whose {@code anyOf} lists Get / Create / Update.
+     * <p>
+     * Read from the document rather than from the file name. The two used to be the same, but the
+     * file is now named after the handler class ({@code PatientResource1_9.json}) while the schemas
+     * inside it are named after the domain object ({@code Patient}, {@code PatientGet_ref}) — so
+     * deriving one from the other gave a null lookup and an NPE.
+     */
+    private static String rootSchemaName(JsonNode schemas, String fileName) {
+        Iterator<Map.Entry<String, JsonNode>> fields = schemas.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> field = fields.next();
+            JsonNode anyOf = field.getValue().get("anyOf");
+            // The root is the only schema whose anyOf branches are all plain $refs to <name>Get /
+            // <name>Create / <name>Update. A representation union (PatientGet) has an anyOf too,
+            // but its branches are the Get_* schemas, which this would also accept — so prefer the
+            // shortest name, which is the root by construction.
+            if (anyOf != null && anyOf.isArray() && anyOf.size() > 0
+                    && field.getKey().indexOf("Get") < 0) {
+                return field.getKey();
+            }
+        }
+        throw new IllegalStateException("No root schema with an anyOf in " + fileName);
+    }
+
+    /**
      * @param schemasDir  path to the resources directory
-     * @param fileName    e.g. "Patient.json"
+     * @param fileName    e.g. "PatientResource1_9.json"
      * @return map of representation name ("default", "full", ...) to its schema node
      */
     public static Map<String, JsonNode> loadRepresentationSchemas(String schemasDir, String fileName)
             throws IOException {
         JsonNode root = MAPPER.readTree(Paths.get(schemasDir, fileName).toFile());
-        String resourceName = fileName.replace(".json", "");
         JsonNode schemas = root.get("schemas");
-        JsonNode anyOf = schemas.get(resourceName).get("anyOf");
+        JsonNode anyOf = schemas.get(rootSchemaName(schemas, fileName)).get("anyOf");
 
         Map<String, JsonNode> result = new LinkedHashMap<>();
         for (JsonNode anyOfItem : anyOf) {

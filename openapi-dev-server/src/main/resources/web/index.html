@@ -122,12 +122,19 @@ const mark = (s, q) => {
       + esc(s.slice(i + q.length));
 };
 
+// Entry names are handler class names — PatientResource1_9, ObsResource2_7 — so scoring the raw
+// name alone would rank nothing as an exact match. Both the trailing version marker and the
+// "Resource"/"Controller" suffix are stripped for comparison, so "patient" still leads with
+// PatientResource1_9 rather than tying with PatientAllergyResource2_0 on a prefix match.
+const shortName = (n) => n.replace(/(Resource|Controller)(\d+(_\d+)*)?$/, '').toLowerCase();
+
 // Exact and prefix name matches outrank incidental field hits, so "patient" leads with the Patient
 // resource rather than the dozen resources that merely have a patient field.
 function score(e, q) {
   const name = e.n.toLowerCase();
-  if (name === q) { return { s: 100, why: '' }; }
-  if (name.startsWith(q)) { return { s: 80, why: '' }; }
+  const short = shortName(e.n);
+  if (name === q || short === q) { return { s: 100, why: '' }; }
+  if (name.startsWith(q) || short.startsWith(q)) { return { s: 80, why: '' }; }
   if (name.includes(q)) { return { s: 60, why: '' }; }
   const route = e.o.find(o => o.p.toLowerCase().includes(q));
   if (route) { return { s: 50, why: route.v.toUpperCase() + ' ' + route.p }; }

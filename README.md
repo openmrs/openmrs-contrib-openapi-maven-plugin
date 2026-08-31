@@ -76,9 +76,10 @@ present, otherwise the project root — and runs the plugin there.
 
 ```
 <module>/omod/target/classes/META-INF/openapi/
-├── openapi.json                  the whole module in one document
-├── resources/<Resource>.json     one file per REST resource
-└── controllers/<Controller>.json one file per @Controller
+├── openapi.json                      the whole module in one document
+├── resources/<HandlerClass>.json     one file per REST resource, named after
+│                                     the handler class (PatientResource1_9.json)
+└── controllers/<Controller>.json     one file per @Controller
 ```
 
 The generated OpenAPI JSON docs are in the module's `target/classes/META-INF` directory, allowing them 
