@@ -164,6 +164,7 @@ class TypeScriptClientGenerator {
         runGenerator(assembledSpec, packageName, packageVersion, external);
         checkGeneratedNameCollisions();
         overloadRepresentationReturns(assembled);
+        flattenAdditionalParamsQuery(assembled);
         importExternalTypes(external);
         rewritePackageJson(packageName, packageVersion, external);
         excludeGeneratorBookkeepingFromTarball();
@@ -722,6 +723,108 @@ class TypeScriptClientGenerator {
                     + " would silently drop ?v= overloads.");
         }
         rewriteRepresentationUnions(representations, emitted);
+    }
+
+    /**
+     * The free-form object query parameter {@code OpenApiSpecGenerator.searchParams()} attaches to
+     * every searchable collection GET, carrying the resource-specific search filters this plugin
+     * does not statically enumerate. Kept in sync with that side by the drift assertion in
+     * {@link #flattenAdditionalParamsQuery}: rename it there without renaming it here and the build
+     * fails rather than silently mis-serialising.
+     */
+    static final String ADDITIONAL_PARAMS = "additionalParams";
+
+    /**
+     * Makes the {@code additionalParams} catch-all actually reach the server.
+     * <p>
+     * openapi-generator's typescript-fetch does not spread a free-form object query parameter. For
+     * {@code additionalParams} (OpenAPI {@code style: form, explode: true}) it emits
+     * <pre>queryParameters['additionalParams'] = requestParameters['additionalParams'];</pre>
+     * and the runtime's {@code querystring} then recurses into the object with a bracketed prefix,
+     * so {@code {limit: '5'}} is sent as {@code additionalParams[limit]=5} — not the flat
+     * {@code limit=5} the OpenMRS REST controller reads with {@code request.getParameter("limit")}.
+     * <p>
+     * This rewrites that assignment to {@code Object.assign(queryParameters, …)}, lifting each
+     * property to a top-level query parameter so {@code querystring} emits it flat. The declared
+     * params (limit, q, …) are assigned first, so an explicit value in {@code additionalParams}
+     * deliberately overrides a same-named declared param.
+     * <p>
+     * Guarded by a drift assertion in the same shape as {@link #overloadRepresentationReturns}: the
+     * number of assignments rewritten must equal the number of operations the assembled document
+     * declares the parameter on. A generator upgrade that changes the emitted line — or a rename on
+     * the spec side — fails the build here rather than silently sending bracketed keys the server
+     * ignores.
+     */
+    private void flattenAdditionalParamsQuery(TypeScriptSpecAssembler.Result assembled)
+            throws MojoExecutionException {
+        int expected = countAdditionalParamsOperations(assembled.document);
+        Path apis = outputDirectory.toPath().resolve("src/apis");
+        if (expected == 0 || !Files.isDirectory(apis)) {
+            return;
+        }
+        String from = "queryParameters['" + ADDITIONAL_PARAMS + "'] = requestParameters['"
+                + ADDITIONAL_PARAMS + "'];";
+        String to = "Object.assign(queryParameters, requestParameters['" + ADDITIONAL_PARAMS + "']);";
+        List<Path> files;
+        try (java.util.stream.Stream<Path> walk = Files.list(apis)) {
+            files = walk.filter(p -> p.getFileName().toString().endsWith(".ts"))
+                    .filter(p -> !p.getFileName().toString().equals("index.ts"))
+                    .sorted().collect(java.util.stream.Collectors.toList());
+        } catch (IOException e) {
+            throw new MojoExecutionException("Failed to list the generated API classes", e);
+        }
+        int rewritten = 0;
+        for (Path file : files) {
+            try {
+                String body = new String(Files.readAllBytes(file),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                int count = 0;
+                for (int idx = body.indexOf(from); idx >= 0; idx = body.indexOf(from, idx + from.length())) {
+                    count++;
+                }
+                if (count == 0) {
+                    continue;
+                }
+                Files.write(file, body.replace(from, to)
+                        .getBytes(java.nio.charset.StandardCharsets.UTF_8));
+                rewritten += count;
+            } catch (IOException e) {
+                throw new MojoExecutionException("Failed to flatten " + ADDITIONAL_PARAMS + " in "
+                        + file, e);
+            }
+        }
+        if (rewritten != expected) {
+            throw new MojoExecutionException("Expected to flatten " + expected + " '"
+                    + ADDITIONAL_PARAMS + "' query assignment(s) but rewrote " + rewritten
+                    + " — the typescript-fetch output shape has drifted, so the free-form search"
+                    + " parameter would serialise as bracketed keys the REST controller ignores.");
+        }
+        log.info("  flattened " + rewritten + " " + ADDITIONAL_PARAMS + " query assignment(s)");
+    }
+
+    /** Operations in the assembled document that declare the {@link #ADDITIONAL_PARAMS} query param. */
+    private static int countAdditionalParamsOperations(
+            com.fasterxml.jackson.databind.node.ObjectNode document) {
+        java.util.Set<String> methods = new java.util.HashSet<>(java.util.Arrays.asList(
+                "get", "put", "post", "delete", "patch", "options", "head", "trace"));
+        int count = 0;
+        for (com.fasterxml.jackson.databind.JsonNode pathItem : document.path("paths")) {
+            java.util.Iterator<Map.Entry<String, com.fasterxml.jackson.databind.JsonNode>> ops =
+                    pathItem.fields();
+            while (ops.hasNext()) {
+                Map.Entry<String, com.fasterxml.jackson.databind.JsonNode> op = ops.next();
+                if (!methods.contains(op.getKey())) {
+                    continue;
+                }
+                for (com.fasterxml.jackson.databind.JsonNode param : op.getValue().path("parameters")) {
+                    if (ADDITIONAL_PARAMS.equals(param.path("name").asText())
+                            && "query".equals(param.path("in").asText())) {
+                        count++;
+                    }
+                }
+            }
+        }
+        return count;
     }
 
     /** What an overload uses for a representation openapi-generator never declared a model for. */

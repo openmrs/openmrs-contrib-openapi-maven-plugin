@@ -607,6 +607,16 @@ public class OpenApiSpecGenerator {
             if (!subtypes.isEmpty()) {
                 listOp.addParametersItem(typeParam(subtypes));
             }
+            for (Parameter p : pagingParams()) {
+                listOp.addParametersItem(p);
+            }
+            // Search params are only accepted where a search can run: MainResourceController.get()
+            // rejects any non-special parameter on a resource that is not Searchable.
+            if (handler instanceof Searchable) {
+                for (Parameter p : searchParams()) {
+                    listOp.addParametersItem(p);
+                }
+            }
             collectionItem.get(listOp);
         }
 
@@ -771,9 +781,20 @@ public class OpenApiSpecGenerator {
             // The controller builds its RequestContext with Representation.REF as the default
             // rather than DEFAULT, but ?v= still overrides, so this takes the same representations
             // as every other GET.
-            .addParametersItem(vParam())
-            .responses(new ApiResponses().addApiResponse("200",
-                new ApiResponse().description("Success").content(jsonContent(responseBody)))));
+            .addParametersItem(vParam()));
+        Operation searchOp = searchItem.getGet();
+        for (Parameter p : pagingParams()) {
+            searchOp.addParametersItem(p);
+        }
+        // Always a search, so its handler's parameters apply regardless of whether the resource
+        // itself is Searchable. The specific filters each SearchHandler declares are runtime data
+        // (the "Allow specifying search handler in URL" TODO); until then additionalParams carries
+        // them.
+        for (Parameter p : searchParams()) {
+            searchOp.addParametersItem(p);
+        }
+        searchOp.responses(new ApiResponses().addApiResponse("200",
+            new ApiResponse().description("Success").content(jsonContent(responseBody))));
         tagPathItem(searchItem, apiTag);
         paths.addPathItem(restPath + "/search/{searchHandlerId}", searchItem);
     }
@@ -814,13 +835,22 @@ public class OpenApiSpecGenerator {
         Schema<?> responseBody = Schemas.object()
             .addProperty("results", Schemas.array().items(resultItems))
             .addProperty("links", Schemas.array().items(Schemas.object()));
-        collectionItem.get(new Operation()
+        Operation subListOp = new Operation()
             .operationId(operationId(apiTag, "GET", SUBRESOURCE_COLLECTION, null))
             .summary("List the " + resourceName + " sub-resources" + ofParent)
             .addParametersItem(parentUuidParam(parentName))
-            .addParametersItem(vParam())
-            .responses(new ApiResponses().addApiResponse("200",
-                new ApiResponse().description("Success").content(jsonContent(responseBody)))));
+            .addParametersItem(vParam());
+        for (Parameter p : pagingParams()) {
+            subListOp.addParametersItem(p);
+        }
+        if (handler instanceof Searchable) {
+            for (Parameter p : searchParams()) {
+                subListOp.addParametersItem(p);
+            }
+        }
+        subListOp.responses(new ApiResponses().addApiResponse("200",
+            new ApiResponse().description("Success").content(jsonContent(responseBody))));
+        collectionItem.get(subListOp);
 
         // A handler that refuses to describe its creatable properties (CustomDatatypeHandler and
         // ObsReferenceRange both throw from save()) genuinely cannot be created, and has no
@@ -1026,6 +1056,63 @@ public class OpenApiSpecGenerator {
         return new Parameter().name("v").in("query")
             .description("The representation to return (ref, default, full, or custom)")
             .schema(Schemas.of("string")._default("default"));
+    }
+
+    /**
+     * Paging and result-count query parameters that {@code RestUtil.getRequestContext} parses on
+     * every collection GET, whether the resource is {@code Listable} or {@code Searchable}. All four
+     * are in {@code RestConstants.SPECIAL_REQUEST_PARAMETERS}, so passing them never trips the
+     * "unknown parameter &rarr; search" branch in {@code MainResourceController.get()} and they are
+     * always safe to document. {@code v} and {@code t} are added separately; {@code s} and
+     * {@code jsessionid} are the other two special params and are deliberately left out — the first
+     * is the named-search selector (covered by {@link #searchParams()}), the second is transport
+     * plumbing.
+     */
+    private static List<Parameter> pagingParams() {
+        return java.util.Arrays.asList(
+            new Parameter().name("limit").in("query")
+                .description("Maximum number of results to return per page")
+                .schema(Schemas.of("integer")),
+            new Parameter().name("startIndex").in("query")
+                .description("Zero-based index of the first result to return, for paging")
+                .schema(Schemas.of("integer")),
+            new Parameter().name("totalCount").in("query")
+                .description("Set to true to include the total count of matching results in the response")
+                .schema(Schemas.of("boolean")),
+            new Parameter().name("includeAll").in("query")
+                .description("Set to true to include voided or retired resources in the results")
+                .schema(Schemas.of("boolean")));
+    }
+
+    /**
+     * Search query parameters, valid only where a search can actually run.
+     * <p>
+     * {@code MainResourceController.get()} throws {@code ResourceDoesNotSupportOperationException}
+     * for any non-special parameter unless the resource is {@code Searchable}, so these are attached
+     * only to {@code Searchable} resources (and to the always-a-search {@code searchByHandler}
+     * route). {@code q} is the near-universal free-text query a resource's
+     * {@code search(RequestContext)} reads; the free-form object catches every other search
+     * parameter — the resource-specific filters that are runtime data this plugin does not yet
+     * enumerate (the "Allow specifying search handler in URL" TODO), plus the {@code s} named-search
+     * selector.
+     * <p>
+     * The object uses {@code style: form, explode: true}: under OpenAPI serialization its own name
+     * disappears and each property becomes its own {@code name=value} pair, so
+     * {@code {patient: "abc"}} is sent as {@code ?patient=abc}. Verified in the pinned Swagger UI,
+     * which renders it as a key/value editor and flattens it onto the request URL on execute.
+     */
+    private static List<Parameter> searchParams() {
+        Schema<?> filters = Schemas.object();
+        filters.setAdditionalProperties(Schemas.of("string"));
+        return java.util.Arrays.asList(
+            new Parameter().name("q").in("query")
+                .description("Free-text search query")
+                .schema(Schemas.of("string")),
+            new Parameter().name("additionalParams").in("query")
+                .description("Any additional resource-specific search filters, each sent as its own "
+                    + "query parameter (e.g. patient, location, fromDate)")
+                .style(Parameter.StyleEnum.FORM).explode(true)
+                .schema(filters));
     }
 
     /**

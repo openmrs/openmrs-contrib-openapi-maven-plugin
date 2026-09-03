@@ -146,7 +146,14 @@ public class GenerateMojo extends AbstractMojo {
                 // NoClassDefFoundError before generation started. The generator classloader is
                 // parent-first, so a module that does ship jsr310 still wins and keeps its own
                 // Jackson stack internally consistent; this copy is only a fallback.
-                || fileName.startsWith("jackson-datatype-jsr310-");
+                || fileName.startsWith("jackson-datatype-jsr310-")
+                // Same story for jackson-dataformat-yaml: swagger-core's Json31.mapper() touches
+                // YAMLFactory as it builds the mapper, so it is part of the tool chain. A module
+                // that does not ship it (e.g. webservices.rest on the typings branch, whose Swagger
+                // removal dropped the transitive copy) failed with
+                // NoClassDefFoundError: com/fasterxml/jackson/dataformat/yaml/YAMLFactory before any
+                // schema was generated. Parent-first delegation keeps a module's own copy winning.
+                || fileName.startsWith("jackson-dataformat-yaml-");
     }
 
     private void prepareOutputDirectory() {
