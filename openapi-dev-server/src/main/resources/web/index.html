@@ -52,6 +52,9 @@
  .leaf { padding: 6px 14px 6px 46px; cursor: pointer; border-left: 3px solid transparent;
          display: flex; align-items: baseline; gap: 6px; }
  .leaf.nested { padding-left: 66px; }
+ /* Non-collapsible label separating a resource's sub-resources from its search handlers. */
+ .subhead { padding: 3px 14px 3px 58px; font-size: 9.5px; text-transform: uppercase;
+            letter-spacing: .5px; color: var(--muted); user-select: none; }
  .leaf .body { flex: 1; min-width: 0; }
  .leaf .twist { width: 9px; font-size: 9px; color: var(--muted); flex: none; margin-left: -13px; }
  .leaf.context .name { color: var(--muted); font-weight: 400; }
@@ -100,10 +103,12 @@
 <script>
 const el = (id) => document.getElementById(id);
 
-// Three buckets, not two. A sub-resource has no separate kind in the index — the plugin documents
-// it as a resource, because that is what it is — so the tree splits on the presence of the derived
-// parent link instead.
-const bucketOf = (e) => e.k === 'controller' ? 'controller' : (e.sub ? 'subresource' : 'resource');
+// Four buckets. A search handler has its own kind; a sub-resource has no separate kind in the index
+// — the plugin documents it as a resource, because that is what it is — so those two split on the
+// presence of the derived parent link instead.
+const bucketOf = (e) => e.k === 'controller' ? 'controller'
+  : e.k === 'searchhandler' ? 'searchhandler'
+  : (e.sub ? 'subresource' : 'resource');
 
 let INDEX = [], BY_MODULE = new Map(), selected = null, renderStart = 0;
 // Collapsed by default: the point of the tree is that you see modules first, not 149 rows. A
@@ -126,7 +131,7 @@ const mark = (s, q) => {
 // name alone would rank nothing as an exact match. Both the trailing version marker and the
 // "Resource"/"Controller" suffix are stripped for comparison, so "patient" still leads with
 // PatientResource1_9 rather than tying with PatientAllergyResource2_0 on a prefix match.
-const shortName = (n) => n.replace(/(Resource|Controller)(\d+(_\d+)*)?$/, '').toLowerCase();
+const shortName = (n) => n.replace(/(SearchHandler|Resource|Controller)(\d+(_\d+)*)?$/, '').toLowerCase();
 
 // Exact and prefix name matches outrank incidental field hits, so "patient" leads with the Patient
 // resource rather than the dozen resources that merely have a patient field.
@@ -197,41 +202,98 @@ function render(rawQuery) {
               </div>`;
     };
 
+    const subHeaderHtml = (label) => `<div class="subhead">${label}</div>`;
+
     const resources = byKind.get('resource') || [];
     const subs = byKind.get('subresource') || [];
+    const searchHandlers = byKind.get('searchhandler') || [];
     const controllers = (byKind.get('controller') || []).sort(byName);
 
-    // Children keyed by parent name. A parent that did not match itself is still drawn, as
-    // context, so searching "identifier" shows Patient > PatientIdentifier rather than an orphan.
-    const kids = new Map();
-    for (const row of subs) {
-      if (!kids.has(row.e.sub)) { kids.set(row.e.sub, []); }
-      kids.get(row.e.sub).push(row);
+    const moduleEntries = BY_MODULE.get(module) || [];
+    // A search handler nests under its resource when that resource is a documented entry in the same
+    // module; otherwise it is orphaned (the resource lives in another module) and gets a module-level
+    // category of its own.
+    const isResourceHere = (name) => moduleEntries.some(e => e.n === name && e.k === 'resource');
+
+    // Full children of every resource, taken from the whole module rather than only the search
+    // matches — so a matched parent (searching "PatientResource") can be expanded to reveal its
+    // sub-resources and search handlers even when none of THEM matched the query.
+    const fullKids = new Map();        // parent name -> [{e}] sub-resources
+    const fullSearchKids = new Map();  // parent name -> [{e}] in-module search handlers
+    for (const e of moduleEntries) {
+      if (e.k === 'searchhandler') {
+        if (e.sub && isResourceHere(e.sub)) {
+          if (!fullSearchKids.has(e.sub)) { fullSearchKids.set(e.sub, []); }
+          fullSearchKids.get(e.sub).push({ e, why: '' });
+        }
+      } else if (e.sub) {
+        if (!fullKids.has(e.sub)) { fullKids.set(e.sub, []); }
+        fullKids.get(e.sub).push({ e, why: '' });
+      }
     }
+
+    // Which children matched the query — decides auto-expansion and carries the hit highlight onto
+    // the matching child row. A parent that did not match itself but has a matched child is still
+    // drawn, as context, so searching "identifier" shows Patient > PatientIdentifier.
+    const matchedChild = new Map();    // child name -> matched row {e, why, s}
+    const matchedParents = new Set();  // parents with at least one matched child
+    const orphanSearch = [];
+    for (const row of subs) {
+      matchedChild.set(row.e.n, row);
+      if (row.e.sub) { matchedParents.add(row.e.sub); }
+    }
+    for (const row of searchHandlers) {
+      if (row.e.sub && isResourceHere(row.e.sub)) {
+        matchedChild.set(row.e.n, row);
+        matchedParents.add(row.e.sub);
+      } else {
+        orphanSearch.push(row);
+      }
+    }
+
     const parentRows = new Map(resources.map(r => [r.e.n, r]));
-    for (const parentName of kids.keys()) {
+    for (const parentName of matchedParents) {
       if (parentRows.has(parentName)) { continue; }
-      const entry = (BY_MODULE.get(module) || []).find(e => e.n === parentName);
+      const entry = moduleEntries.find(e => e.n === parentName);
       if (entry) { parentRows.set(parentName, { e: entry, why: '', s: -1, context: true }); }
     }
 
+    const nestedSearchCount = searchHandlers.length - orphanSearch.length;
     if (parentRows.size) {
       const node = module + '/resources';
       const isOpen = q ? true : open.has(node);
       html += `<div class="group kind" data-node="${esc(node)}">
                  <span class="caret">${isOpen ? '▾' : '▸'}</span>Resources
-                 <span class="count">${resources.length + subs.length}</span></div>`;
+                 <span class="count">${resources.length + subs.length + nestedSearchCount}</span></div>`;
       if (isOpen) {
+        // A matched child carries its highlight; a child pulled in only to fill out an expanded
+        // parent renders plain.
+        const decorate = (c) => matchedChild.get(c.e.n) || c;
         for (const row of [...parentRows.values()].sort(byName)) {
-          const children = (kids.get(row.e.n) || []).sort(byName);
+          const childSubs = (fullKids.get(row.e.n) || []).sort(byName);
+          const childSearch = (fullSearchKids.get(row.e.n) || []).sort(byName);
+          const kidCount = childSubs.length + childSearch.length;
           const kidNode = module + '/r/' + row.e.n;
-          // While searching, a parent with matching children is open so the hit is visible.
-          const kidsOpen = (q && children.length) ? true : open.has(kidNode);
+          // Auto-expand only when a child actually matched, so a matched parent still gets a twisty
+          // but stays collapsed until clicked; the twisty itself reflects the full child count.
+          const kidsOpen = (q && matchedParents.has(row.e.n)) ? true : open.has(kidNode);
           html += leafHtml(row, {
-            hasKids: children.length > 0, open: kidsOpen, node: kidNode,
-            context: row.context, kidCount: children.length || 0
+            hasKids: kidCount > 0, open: kidsOpen, node: kidNode,
+            context: row.context, kidCount: kidCount || 0
           });
-          if (kidsOpen) { html += children.map(c => leafHtml(c, { nested: true })).join(''); }
+          if (kidsOpen) {
+            // Search handlers always get a label (they look like sub-resources otherwise); the
+            // sub-resource label appears only when search handlers are also shown, so the common
+            // subs-only resource keeps its plain, unlabelled look.
+            if (childSubs.length) {
+              if (childSearch.length) { html += subHeaderHtml('Sub-resources'); }
+              html += childSubs.map(c => leafHtml(decorate(c), { nested: true })).join('');
+            }
+            if (childSearch.length) {
+              html += subHeaderHtml('Search handlers');
+              html += childSearch.map(c => leafHtml(decorate(c), { nested: true })).join('');
+            }
+          }
         }
       }
     }
@@ -243,6 +305,17 @@ function render(rawQuery) {
                  <span class="caret">${isOpen ? '▾' : '▸'}</span>Controllers
                  <span class="count">${controllers.length}</span></div>`;
       if (isOpen) { html += controllers.map(r => leafHtml(r, {})).join(''); }
+    }
+
+    // Search handlers whose resource is documented by another module have no resource node to nest
+    // under, so they get their own sibling category — shown only when there are any.
+    if (orphanSearch.length) {
+      const node = module + '/searchhandlers';
+      const isOpen = q ? true : open.has(node);
+      html += `<div class="group kind" data-node="${esc(node)}">
+                 <span class="caret">${isOpen ? '▾' : '▸'}</span>Search handlers
+                 <span class="count">${orphanSearch.length}</span></div>`;
+      if (isOpen) { html += orphanSearch.sort(byName).map(r => leafHtml(r, {})).join(''); }
     }
   }
 
@@ -278,11 +351,21 @@ function select(module, name) {
   }
   selected = { m: module, n: name };
 
-  // Open the branch the selection lives on, so a link straight to a sub-resource lands with its
-  // parent expanded rather than in a collapsed tree.
+  // Open the branch the selection lives on, so a link straight to a sub-resource or search handler
+  // lands with its parent expanded rather than in a collapsed tree.
   open.add(module);
-  open.add(module + '/' + (entry.k === 'controller' ? 'controllers' : 'resources'));
-  if (entry.sub) { open.add(module + '/r/' + entry.sub); }
+  if (entry.k === 'searchhandler') {
+    const inModule = (BY_MODULE.get(module) || []).some(e => e.n === entry.sub && e.k === 'resource');
+    if (inModule) {
+      open.add(module + '/resources');
+      open.add(module + '/r/' + entry.sub);
+    } else {
+      open.add(module + '/searchhandlers');
+    }
+  } else {
+    open.add(module + '/' + (entry.k === 'controller' ? 'controllers' : 'resources'));
+    if (entry.sub) { open.add(module + '/r/' + entry.sub); }
+  }
   render(el('q').value);
   const row = document.querySelector('.leaf.sel');
   if (row) { row.scrollIntoView({ block: 'nearest' }); }

@@ -55,6 +55,7 @@ public class OpenApiSpecGenerator {
 
     private List<DelegatingResourceHandler<?>> handlers;
     private List<Class<?>> controllerClasses;
+    private List<HandlerScanner.SearchHandlerInfo> searchHandlers = Collections.emptyList();
 
     /** Parent resource handler -> the subclass handlers bound to it. Usually empty. */
     private java.util.Map<DelegatingResourceHandler<?>, List<DelegatingSubclassHandler<?, ?>>> subclassHandlers =
@@ -98,6 +99,13 @@ public class OpenApiSpecGenerator {
         OpenMRSResourceModelResolver.registerResourceNames(handlers, subclassHandlers);
 
         controllerClasses = scanner.findControllers();
+
+        // SearchHandlers carry supportedOpenmrsVersions on the SearchConfig their instances build, so
+        // discovery instantiates and version-filters them just as RestServiceImpl.addSearchHandler
+        // does. They are documented as their own endpoints (see addSearchHandlerDocs), not folded into
+        // a resource's schemas, so the StubRuntime RestService proxy deliberately does NOT answer
+        // getSearchHandlers() — leaving existing resource schemas untouched.
+        searchHandlers = scanner.findSearchHandlers();
     }
 
     public void generateOpenAPISpec(String outputDir, String outputFile) {
@@ -140,6 +148,7 @@ public class OpenApiSpecGenerator {
         // inside the omod JAR. It also made the reported count disagree with the files on disk.
         clearGeneratedJson(schemaDir);
         clearGeneratedJson(Paths.get(outputDir, "controllers"));
+        clearGeneratedJson(Paths.get(outputDir, "searchHandlers"));
 
         // Json31, not Json: the spec is built as SpecVersion.V31 and the 3.0 writer silently drops
         // 3.1-only constructs (const, type arrays, examples) and stamps "openapi": "3.0.1".
@@ -255,6 +264,12 @@ public class OpenApiSpecGenerator {
             }
         }
 
+        // Document each discovered SearchHandler as its own endpoint. Its operations are kept out of
+        // the TypeScript client by the x-openmrs-skip-typescript extension, not by their tag (see
+        // addSearchHandlerDocs and SKIP_TYPESCRIPT_EXTENSION).
+        java.util.SortedSet<String> searchHandlerTags =
+            addSearchHandlerDocs(outputDir, openAPI, swaggerMapper);
+
         // One tag per resource and per controller — the thing a reader would look the operation up
         // under — rather than the two blanket "Resources" / "Controllers" tags this used to carry.
         //
@@ -278,6 +293,9 @@ public class OpenApiSpecGenerator {
         java.util.SortedSet<String> sharedTags = new java.util.TreeSet<String>(resourceTags);
         sharedTags.retainAll(controllerTags);
         declaredTags.addAll(controllerTags);
+        // Per-handler search-handler tags, outside the *Resource / *Controller namespaces. The
+        // deprecated generic route keeps its resource's own tag, so nothing extra is declared for it.
+        declaredTags.addAll(searchHandlerTags);
         for (String tag : declaredTags) {
             openAPI.addTagsItem(new io.swagger.v3.oas.models.tags.Tag().name(tag));
         }
@@ -548,6 +566,18 @@ public class OpenApiSpecGenerator {
     private static final String RESOURCE_COLLECTION = "/{resource}";
     private static final String RESOURCE_INSTANCE = "/{resource}/{uuid}";
     private static final String RESOURCE_SEARCH = "/{resource}/search/{searchHandlerId}";
+
+    /**
+     * Vendor extension marking an operation that must not become a TypeScript client method, even
+     * though it is documented in {@code openapi.json} and the dev server. Used for the deprecated
+     * {@code search/{searchHandlerId}} route and the concrete per-handler search routes: their
+     * parameters are untyped, so a generated method would promise more than it can keep.
+     * <p>
+     * Deliberately a vendor extension rather than a tag, so these operations can keep their
+     * <em>resource's</em> tag and render inline with it in the docs UI instead of in a section of
+     * their own. {@code TypeScriptSpecAssembler.mergeResourcePaths} honours it.
+     */
+    static final String SKIP_TYPESCRIPT_EXTENSION = "x-openmrs-skip-typescript";
     private static final String SUBRESOURCE_COLLECTION = "/{resource}/{parentUuid}/{subResource}";
     private static final String SUBRESOURCE_INSTANCE =
         "/{resource}/{parentUuid}/{subResource}/{uuid}";
@@ -775,6 +805,14 @@ public class OpenApiSpecGenerator {
         PathItem searchItem = new PathItem().get(new Operation()
             .operationId(operationId(apiTag, "GET", RESOURCE_SEARCH, null))
             .summary("Search " + resourceName + " resources with a named search handler")
+            // Deprecated in favour of the concrete /{resource}/search/<id> routes, which enumerate
+            // the handlers that actually exist and the parameters each accepts. This generic shape is
+            // kept only to document the route template; the deprecated flag renders as a warning in
+            // Swagger UI, and the non-*Resource tag keeps it out of the TypeScript client.
+            .deprecated(true)
+            .description("Deprecated: prefer the specific " + restPath + "/search/<id> routes, which "
+                + "document each SearchHandler and its parameters. This template accepts any "
+                + "SearchHandler id declared for this resource.")
             .addParametersItem(new Parameter().name("searchHandlerId").in("path").required(true)
                 .description("Id of the SearchHandler to run, as declared by its SearchConfig")
                 .schema(Schemas.of("string")))
@@ -795,8 +833,242 @@ public class OpenApiSpecGenerator {
         }
         searchOp.responses(new ApiResponses().addApiResponse("200",
             new ApiResponse().description("Success").content(jsonContent(responseBody))));
+        // Excluded from the TypeScript client by the vendor extension, not by its tag — so it keeps
+        // the resource's own tag and renders inline with the resource's other operations (crossed out,
+        // because it is deprecated) rather than in a section of its own.
+        searchOp.addExtension(SKIP_TYPESCRIPT_EXTENSION, Boolean.TRUE);
         tagPathItem(searchItem, apiTag);
         paths.addPathItem(restPath + "/search/{searchHandlerId}", searchItem);
+    }
+
+    /**
+     * Documents each module-owned {@code SearchHandler} as a concrete
+     * {@code GET /{resource}/search/<id>} operation — the enumerated counterpart to the deprecated
+     * generic {@code search/{searchHandlerId}} route.
+     * <p>
+     * Written both to {@code searchHandlers/<HandlerClass>.json} (so the dev server can list it as its
+     * own navigable entry) and into {@code openapi.json} (so the slice can be rendered). Every
+     * operation carries a per-handler tag ending in {@code SearchHandler} and the
+     * {@link #SKIP_TYPESCRIPT_EXTENSION} marker, which is what keeps it out of the TypeScript client:
+     * search-handler params are not statically typed (that is the {@code TypedSearchConfig} work), so
+     * a generated method would promise more than it can keep.
+     * <p>
+     * The target resource (named by {@code SearchConfig.getSupportedResource()}, e.g. {@code v1/concept})
+     * supplies the route prefix and the {@code <Name>Get_ref} result schema. When it belongs to another
+     * module the {@code $ref} is cross-module and left dangling here, resolved by the dev server's
+     * catalog exactly as the resource half's cross-module refs are.
+     *
+     * @return the tags emitted, to be declared on the document
+     */
+    private java.util.SortedSet<String> addSearchHandlerDocs(String outputDir, OpenAPI openAPI,
+            com.fasterxml.jackson.databind.ObjectMapper swaggerMapper) {
+        java.util.SortedSet<String> tags = new java.util.TreeSet<String>();
+        if (searchHandlers == null || searchHandlers.isEmpty()) {
+            return tags;
+        }
+        // The concrete routes are served by MainResourceController.searchByHandler, which — like the
+        // generic route in addSearchHandlerPath — did not exist before REST 2.42.0. Documenting
+        // /{resource}/search/<id> there would describe endpoints that 404. The handlers are still
+        // reachable via the collection route's ?s= search, which is documented separately.
+        if (ROUTE_NAMES.nameFor("GET", RESOURCE_SEARCH, null) == null) {
+            System.out.println("Skipping search handler endpoints: this REST version does not map "
+                    + "the search/{searchHandlerId} route");
+            return tags;
+        }
+        Path dir = Paths.get(outputDir, "searchHandlers");
+        try {
+            Files.createDirectories(dir);
+        } catch (Exception e) {
+            throw new RuntimeException("Unable to create search-handler output directory: " + dir, e);
+        }
+
+        // supportedResource ("v1/concept") -> the resource handler that owns its route and schema name.
+        java.util.Map<String, DelegatingResourceHandler<?>> byRestName =
+            new java.util.LinkedHashMap<String, DelegatingResourceHandler<?>>();
+        for (DelegatingResourceHandler<?> handler : handlers) {
+            String restName = restNameOf(handler);
+            if (restName != null) {
+                byRestName.putIfAbsent(restName, handler);
+            }
+        }
+
+        io.swagger.v3.oas.models.Paths searchPaths = new io.swagger.v3.oas.models.Paths();
+        java.util.Set<String> usedOperationIds = new java.util.HashSet<String>();
+        int documented = 0;
+        int orphaned = 0;
+
+        for (HandlerScanner.SearchHandlerInfo info : searchHandlers) {
+            if (!ModuleOwnership.isOwned(info.handlerClass, ownedLocations)) {
+                continue;
+            }
+            DelegatingResourceHandler<?> target = byRestName.get(info.supportedResource);
+            // A search handler bound to a sub-resource is reachable only via ?s= on the sub-resource
+            // collection route (already documented) — MainSubResourceController has no
+            // search/{searchHandlerId} route, so a /{parent}/{uuid}/{sub}/search/<id> path would 404.
+            if (target instanceof SubResource) {
+                System.out.println("  skipping search handler " + info.handlerClass.getSimpleName()
+                        + ": its resource '" + info.supportedResource + "' is a sub-resource, which "
+                        + "has no search/{searchHandlerId} route");
+                continue;
+            }
+            String restPath;
+            String schemaName;
+            if (target != null) {
+                restPath = OpenMRSResourceModelResolver.getResourceRestPath(target);
+                schemaName = OpenMRSResourceModelResolver.getResourceName(target);
+            } else {
+                // The target resource is not on the classpath at all — document a best-effort path and
+                // a generic object result rather than dropping the handler.
+                restPath = "/ws/rest/" + info.supportedResource;
+                schemaName = null;
+                System.out.println("WARN  search handler " + info.handlerClass.getSimpleName()
+                        + " targets unknown resource '" + info.supportedResource
+                        + "'; documenting with a generic result");
+            }
+            boolean orphan = target == null
+                || !ModuleOwnership.isOwned(target.getClass(), ownedLocations);
+
+            String tag = searchHandlerTag(info.handlerClass);
+            tags.add(tag);
+            String operationId = uniqueOperationId(tag + "_" + sanitizeId(info.id), usedOperationIds);
+
+            String schemaRef = "#/components/schemas/";
+            Schema<?> resultItems = schemaName != null
+                ? Schemas.ref(schemaRef + schemaName + "Get_ref") : Schemas.object();
+            Schema<?> responseBody = Schemas.object()
+                .addProperty("results", Schemas.array().items(resultItems))
+                .addProperty("links", Schemas.array().items(Schemas.object()));
+
+            Operation op = new Operation()
+                .operationId(operationId)
+                .summary("Search " + (schemaName != null ? schemaName : info.supportedResource)
+                    + " resources with the '" + info.id + "' search handler")
+                .description(searchHandlerDescription(info))
+                .addParametersItem(vParam());
+            java.util.Set<String> seenParams = new java.util.HashSet<String>();
+            seenParams.add("v");
+            for (Parameter p : pagingParams()) {
+                op.addParametersItem(p);
+                seenParams.add(p.getName());
+            }
+            for (Parameter p : searchParams()) {
+                op.addParametersItem(p);
+                seenParams.add(p.getName());
+            }
+            // The handler's own declared parameters, as untyped strings. Names are all that reflection
+            // yields today; the additionalParams catch-all still covers anything not enumerated.
+            for (String name : info.requiredParams) {
+                addNamedSearchParam(op, name, true, seenParams);
+            }
+            for (String name : info.optionalParams) {
+                addNamedSearchParam(op, name, false, seenParams);
+            }
+            op.responses(new ApiResponses().addApiResponse("200",
+                new ApiResponse().description("Success").content(jsonContent(responseBody))));
+            op.addTagsItem(tag);
+            // Excluded from the TypeScript client: search-handler params are untyped.
+            op.addExtension(SKIP_TYPESCRIPT_EXTENSION, Boolean.TRUE);
+
+            String routeKey = restPath + "/search/" + info.id;
+            PathItem item = new PathItem().get(op);
+            searchPaths.addPathItem(routeKey, item);
+            writeSearchHandlerFile(dir, info.handlerClass, routeKey, item, swaggerMapper);
+            documented++;
+            if (orphan) {
+                orphaned++;
+            }
+        }
+
+        if (!searchPaths.isEmpty()) {
+            if (openAPI.getPaths() == null) {
+                openAPI.paths(new io.swagger.v3.oas.models.Paths());
+            }
+            openAPI.getPaths().putAll(searchPaths);
+        }
+        System.out.println("Documented " + documented + " search handler(s)"
+            + (orphaned > 0 ? " (" + orphaned
+                + " orphaned — target resource is owned by another module)" : ""));
+        return tags;
+    }
+
+    private static void writeSearchHandlerFile(Path dir, Class<?> handlerClass, String routeKey,
+            PathItem item, com.fasterxml.jackson.databind.ObjectMapper swaggerMapper) {
+        io.swagger.v3.oas.models.Paths paths = new io.swagger.v3.oas.models.Paths();
+        paths.addPathItem(routeKey, item);
+        com.fasterxml.jackson.databind.node.ObjectNode root = swaggerMapper.createObjectNode();
+        root.set("paths", swaggerMapper.valueToTree(paths));
+        Path outFile = dir.resolve(handlerClass.getSimpleName() + ".json");
+        try {
+            Files.write(outFile, swaggerMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(root));
+            System.out.println("Wrote search handler file: " + outFile.toAbsolutePath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /** Adds an untyped string query param, skipping a name already documented on the operation. */
+    private static void addNamedSearchParam(Operation op, String name, boolean required,
+            java.util.Set<String> seen) {
+        if (name == null || name.isEmpty() || !seen.add(name)) {
+            return;
+        }
+        op.addParametersItem(new Parameter().name(name).in("query").required(required)
+            .description(required ? "Required search parameter" : "Optional search parameter")
+            .schema(Schemas.of("string")));
+    }
+
+    private static String searchHandlerDescription(HandlerScanner.SearchHandlerInfo info) {
+        StringBuilder sb = new StringBuilder("Named search handler '").append(info.id)
+            .append("' for ").append(info.supportedResource).append('.');
+        if (!info.queryDescriptions.isEmpty()) {
+            sb.append(" Supported searches: ");
+            sb.append(String.join("; ", info.queryDescriptions));
+        }
+        return sb.toString();
+    }
+
+    /**
+     * The tag for a search-handler operation: the handler class's simple name with a trailing REST
+     * version marker stripped, e.g. {@code ConceptSearchHandler1_8 -> ConceptSearchHandler}. It ends
+     * in {@code SearchHandler}, never {@code Resource}, which is what keeps it out of the TS client.
+     */
+    private static String searchHandlerTag(Class<?> handlerClass) {
+        return handlerClass.getSimpleName().replaceAll("\\d+(_\\d+)*$", "");
+    }
+
+    private static String sanitizeId(String id) {
+        return id == null ? "" : id.replaceAll("[^A-Za-z0-9]+", "_");
+    }
+
+    private static String uniqueOperationId(String base, java.util.Set<String> used) {
+        if (used.add(base)) {
+            return base;
+        }
+        for (int i = 2; ; i++) {
+            String candidate = base + i;
+            if (used.add(candidate)) {
+                return candidate;
+            }
+        }
+    }
+
+    /** The REST name a handler serves ({@code @Resource.name()}, or the sub-resource composite). */
+    private static String restNameOf(DelegatingResourceHandler<?> handler) {
+        org.openmrs.module.webservices.rest.web.annotation.Resource resource = handler.getClass()
+            .getAnnotation(org.openmrs.module.webservices.rest.web.annotation.Resource.class);
+        if (resource != null) {
+            return resource.name();
+        }
+        org.openmrs.module.webservices.rest.web.annotation.SubResource sub = handler.getClass()
+            .getAnnotation(org.openmrs.module.webservices.rest.web.annotation.SubResource.class);
+        if (sub != null) {
+            org.openmrs.module.webservices.rest.web.annotation.Resource parent = sub.parent()
+                .getAnnotation(org.openmrs.module.webservices.rest.web.annotation.Resource.class);
+            if (parent != null) {
+                return parent.name() + "/" + sub.path();
+            }
+        }
+        return null;
     }
 
     /**

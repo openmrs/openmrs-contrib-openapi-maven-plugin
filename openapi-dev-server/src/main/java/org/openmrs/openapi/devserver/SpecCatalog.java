@@ -110,7 +110,8 @@ final class SpecCatalog {
      */
     private List<ResourceEntry> readEntries(String module, File openApiDir) throws IOException {
         List<ResourceEntry> found = new ArrayList<ResourceEntry>();
-        String[][] kinds = { { "resource", "resources" }, { "controller", "controllers" } };
+        String[][] kinds = { { "resource", "resources" }, { "controller", "controllers" },
+            { "searchhandler", "searchHandlers" } };
         for (String[] kind : kinds) {
             File folder = new File(openApiDir, kind[1]);
             File[] files = folder.listFiles((dir, name) -> name.endsWith(".json"));
@@ -155,7 +156,8 @@ final class SpecCatalog {
                     entry.fields.addAll(sorted);
                 }
 
-                entry.parent = parentSegment(operations);
+                entry.parent = "searchhandler".equals(kind[0])
+                    ? searchParentSegment(operations) : parentSegment(operations);
                 found.add(entry);
             }
         }
@@ -172,6 +174,23 @@ final class SpecCatalog {
             String[] segments = op.path.split("/");
             for (int i = 1; i < segments.length; i++) {
                 if ("{parentUuid}".equals(segments[i]) && !segments[i - 1].isEmpty()) {
+                    return segments[i - 1];
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * A search handler is served at {@code /{resource}/search/{id}}, so the segment before
+     * {@code search} names the resource it belongs to. {@link #resolveParents} then rewrites that raw
+     * segment to the resource entry's name, exactly as it does for a sub-resource's parent.
+     */
+    private static String searchParentSegment(List<ResourceEntry.Operation> operations) {
+        for (ResourceEntry.Operation op : operations) {
+            String[] segments = op.path.split("/");
+            for (int i = 1; i < segments.length; i++) {
+                if ("search".equals(segments[i]) && !segments[i - 1].isEmpty()) {
                     return segments[i - 1];
                 }
             }
@@ -230,8 +249,8 @@ final class SpecCatalog {
             }
         }
         if (unresolved > 0) {
-            warnings.add(unresolved + " sub-resource(s) kept a raw parent segment "
-                + "(no resource serves that route)");
+            warnings.add(unresolved + " sub-resource(s)/search handler(s) kept a raw parent segment "
+                + "(no loaded module serves that route)");
         }
     }
 

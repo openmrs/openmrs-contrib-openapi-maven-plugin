@@ -2,14 +2,22 @@ package org.openmrs.plugin.openapi;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
 
 import org.openmrs.module.ModuleUtil;
 import org.openmrs.module.webservices.rest.util.ReflectionUtil;
 import org.openmrs.module.webservices.rest.web.annotation.SubClassHandler;
 import org.openmrs.module.webservices.rest.web.annotation.SubResource;
+import org.openmrs.module.webservices.rest.web.resource.api.SearchConfig;
+import org.openmrs.module.webservices.rest.web.resource.api.SearchHandler;
+import org.openmrs.module.webservices.rest.web.resource.api.SearchParameter;
+import org.openmrs.module.webservices.rest.web.resource.api.SearchQuery;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingResourceHandler;
 import org.openmrs.module.webservices.rest.web.resource.impl.DelegatingSubclassHandler;
 import org.openmrs.util.OpenmrsConstants;
@@ -208,6 +216,76 @@ public class HandlerScanner {
     }
 
     /**
+     * Discovers the {@code SearchHandler}s this module and its dependencies register, version-filtered
+     * and de-duplicated the same way {@code RestServiceImpl} does at runtime.
+     * <p>
+     * Unlike a resource, a search handler carries its {@code supportedOpenmrsVersions} on the
+     * {@code SearchConfig} its instance builds, not on an annotation — so filtering can only happen
+     * <em>after</em> instantiation. {@code RestServiceImpl.addSearchHandler} does exactly this:
+     * instantiate (from Spring), read {@code getSearchConfig().getSupportedOpenmrsVersions()}, keep
+     * the ones matching the running core, and reject a second handler claiming the same
+     * {@code (supportedResource, id)}.
+     * <p>
+     * The body is guarded per handler, and once overall: a search-handler API method missing on an
+     * older REST yields fewer params (or an empty list), never an aborted run — mirroring the
+     * route-existence guard on the search route itself.
+     */
+    public List<SearchHandlerInfo> findSearchHandlers() {
+        List<SearchHandlerInfo> found = new ArrayList<SearchHandlerInfo>();
+        try {
+            List<Class<?>> classes = scan(new AssignableTypeFilter(SearchHandler.class));
+            // scan() order is undefined, so sort by class name before the (resource, id) dedupe —
+            // otherwise which handler wins a collision would vary between runs. See CLAUDE.md
+            // "Output determinism".
+            Collections.sort(classes, Comparator.comparing(Class::getName));
+
+            Map<String, SearchHandlerInfo> byKey = new LinkedHashMap<String, SearchHandlerInfo>();
+            int versionFiltered = 0;
+            for (Class<?> cls : classes) {
+                try {
+                    Object instance = instantiate(cls);
+                    if (!(instance instanceof SearchHandler)) {
+                        continue;
+                    }
+                    SearchConfig config = ((SearchHandler) instance).getSearchConfig();
+                    if (config == null) {
+                        continue;
+                    }
+                    Set<String> versions = config.getSupportedOpenmrsVersions();
+                    if (!versionMatches(versions.toArray(new String[versions.size()]))) {
+                        versionFiltered++;
+                        continue;
+                    }
+                    SearchHandlerInfo info = SearchHandlerInfo.from(cls, config);
+                    // (supportedResource, id) is unique at runtime — RestServiceImpl throws on a
+                    // collision. Keep the first after the name sort, so the winner is deterministic.
+                    byKey.putIfAbsent(info.supportedResource + "|" + info.id, info);
+                } catch (Throwable t) {
+                    System.out.println("WARN  could not read SearchHandler " + cls.getName() + ": " + t);
+                }
+            }
+            found.addAll(byKey.values());
+            reportCounts("search handlers", infoClasses(found), found.size());
+            if (versionFiltered > 0) {
+                System.out.println("  (" + versionFiltered + " search handler(s) skipped: "
+                        + "supportedOpenmrsVersions did not match core "
+                        + OpenmrsConstants.OPENMRS_VERSION_SHORT + ")");
+            }
+        } catch (Throwable t) {
+            System.out.println("WARN  search handler discovery skipped: " + t);
+        }
+        return found;
+    }
+
+    private static List<Class<?>> infoClasses(List<SearchHandlerInfo> infos) {
+        List<Class<?>> classes = new ArrayList<Class<?>>();
+        for (SearchHandlerInfo info : infos) {
+            classes.add(info.handlerClass);
+        }
+        return classes;
+    }
+
+    /**
      * Subclass handlers are Spring components at runtime
      * ({@code Context.getRegisteredComponents(DelegatingSubclassHandler.class)}). Scanning for
      * concrete implementations carrying a {@code @SubClassHandler} is the reflection equivalent,
@@ -399,6 +477,100 @@ public class HandlerScanner {
         ResourceDefinition(Object instance, int order) {
             this.instance = instance;
             this.order = order;
+        }
+    }
+
+    /**
+     * A discovered {@code SearchHandler}, reduced to what the generator documents: its class (for
+     * ownership and file naming), the {@code SearchConfig}'s id and {@code supportedResource}, and
+     * the parameter names it accepts.
+     * <p>
+     * A config may hold several {@code SearchQuery}s — alternative ways to search — so a parameter is
+     * reported as <b>required</b> only when it is required in <em>every</em> query (i.e. genuinely
+     * always required). Everything else is optional, which is honest for the disjunctive case: a
+     * {@code Concept} search by {@code source} OR by {@code name} OR by {@code references} makes none
+     * of the three unconditionally required. Names and descriptions are sorted so the output is
+     * deterministic regardless of the {@code Set} iteration order.
+     */
+    public static final class SearchHandlerInfo {
+
+        public final Class<?> handlerClass;
+
+        public final String id;
+
+        public final String supportedResource;
+
+        /** Params required in every {@code SearchQuery} of the config, sorted. */
+        public final List<String> requiredParams;
+
+        /** Every other distinct param across the config's queries, sorted. */
+        public final List<String> optionalParams;
+
+        /** One human-readable description per {@code SearchQuery}, sorted. */
+        public final List<String> queryDescriptions;
+
+        SearchHandlerInfo(Class<?> handlerClass, String id, String supportedResource,
+                List<String> requiredParams, List<String> optionalParams,
+                List<String> queryDescriptions) {
+            this.handlerClass = handlerClass;
+            this.id = id;
+            this.supportedResource = supportedResource;
+            this.requiredParams = requiredParams;
+            this.optionalParams = optionalParams;
+            this.queryDescriptions = queryDescriptions;
+        }
+
+        static SearchHandlerInfo from(Class<?> cls, SearchConfig config) {
+            String id = config.getId();
+            String supportedResource = config.getSupportedResource();
+            Set<String> allParams = new TreeSet<String>();
+            Set<String> alwaysRequired = null;
+            Set<String> descriptions = new TreeSet<String>();
+            try {
+                for (SearchQuery query : config.getSearchQueries()) {
+                    Set<String> required = paramNames(query.getRequiredParameters());
+                    Set<String> optional = paramNames(query.getOptionalParameters());
+                    allParams.addAll(required);
+                    allParams.addAll(optional);
+                    String description = query.getDescription();
+                    if (description != null && !description.trim().isEmpty()) {
+                        descriptions.add(description.trim());
+                    }
+                    if (alwaysRequired == null) {
+                        alwaysRequired = new TreeSet<String>(required);
+                    } else {
+                        alwaysRequired.retainAll(required);
+                    }
+                }
+            } catch (Throwable t) {
+                // Older REST may not expose the SearchQuery param getters; still document existence.
+                System.out.println("  note: could not enumerate params for " + cls.getSimpleName()
+                        + " (" + t + ")");
+            }
+            if (alwaysRequired == null) {
+                alwaysRequired = new TreeSet<String>();
+            }
+            List<String> requiredParams = new ArrayList<String>(alwaysRequired);
+            List<String> optionalParams = new ArrayList<String>();
+            for (String param : allParams) {
+                if (!alwaysRequired.contains(param)) {
+                    optionalParams.add(param);
+                }
+            }
+            return new SearchHandlerInfo(cls, id, supportedResource, requiredParams, optionalParams,
+                    new ArrayList<String>(descriptions));
+        }
+
+        private static Set<String> paramNames(Set<SearchParameter> params) {
+            Set<String> names = new TreeSet<String>();
+            if (params != null) {
+                for (SearchParameter param : params) {
+                    if (param != null && param.getName() != null) {
+                        names.add(param.getName());
+                    }
+                }
+            }
+            return names;
         }
     }
 }

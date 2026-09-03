@@ -28,7 +28,11 @@ final class ResourceEntry {
     }
 
     final String module;
-    /** "resource" or "controller" — a sub-resource is a resource with {@link #parent} set. */
+    /**
+     * "resource", "controller", or "searchhandler". A sub-resource is a "resource" with
+     * {@link #parent} set; a search handler is a "searchhandler" whose {@link #parent} names the
+     * resource it searches.
+     */
     final String kind;
     /** The name of the generated file, without ".json" — e.g. "Patient", "FormResource". */
     final String name;

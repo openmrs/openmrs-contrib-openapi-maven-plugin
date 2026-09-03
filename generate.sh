@@ -109,6 +109,9 @@ generate_for_module() {
     if [ -d "$output_dir/controllers" ]; then
         echo "  controllers/     $(find "$output_dir/controllers" -name '*.json' | wc -l) controller files"
     fi
+    if [ -d "$output_dir/searchHandlers" ]; then
+        echo "  searchHandlers/  $(find "$output_dir/searchHandlers" -name '*.json' | wc -l) search handler files"
+    fi
     local package_dir="$(dirname "$target_classes")/generated-typescript"
     if [ -d "$package_dir" ]; then
         echo "  typescript/      $(find "$package_dir/src" -name '*.ts' | wc -l) source files"

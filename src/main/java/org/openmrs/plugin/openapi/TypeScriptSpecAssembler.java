@@ -154,6 +154,13 @@ class TypeScriptSpecAssembler {
                 if (!op.getValue().isObject()) {
                     continue;
                 }
+                // An operation may share its resource's tag (so the docs UI renders it inline) yet be
+                // marked out of the client — the deprecated searchByHandler route and the concrete
+                // search-handler routes both do, because their parameters are untyped. Honour that
+                // before the tag check.
+                if (op.getValue().path(OpenApiSpecGenerator.SKIP_TYPESCRIPT_EXTENSION).asBoolean(false)) {
+                    continue;
+                }
                 String tag = firstTag((ObjectNode) op.getValue());
                 if (tag == null || !tag.endsWith("Resource")) {
                     continue;

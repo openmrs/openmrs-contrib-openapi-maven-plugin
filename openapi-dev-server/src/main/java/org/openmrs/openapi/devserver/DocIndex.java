@@ -9,9 +9,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
  * <p>
  * Keys are one letter because this is fetched on every page load and the whole point of the
  * document is to be small — {@code m}odule, {@code k}ind, {@code n}ame, {@code o}perations
- * ({@code p}ath, {@code v}erb, {@code s}ummary), {@code f}ields, and {@code sub} for a
- * sub-resource's parent. Across the four modules under test that is ~100&nbsp;KB describing
- * 1.6&nbsp;MB of specs, and it parses in about a millisecond.
+ * ({@code p}ath, {@code v}erb, {@code s}ummary), {@code f}ields, and {@code sub} for the parent of a
+ * sub-resource or a search handler. Across the four modules under test that is ~100&nbsp;KB
+ * describing 1.6&nbsp;MB of specs, and it parses in about a millisecond.
  * <p>
  * The plugin already knows all of this at build time. Emitting it per module as
  * {@code META-INF/openapi/index.json} and merging the per-module copies at startup is the
