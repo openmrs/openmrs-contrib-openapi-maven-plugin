@@ -63,26 +63,21 @@ final class Json {
     }
 
     /**
-     * Points a document at the dev server's reverse proxy and declares HTTP basic auth, which is
-     * what makes the renderer's "try it" button work without tripping CORS.
+     * Points a document at the dev server's reverse proxy so the renderer's "try it" button reaches
+     * the upstream without tripping CORS. No security scheme is declared: the proxy attaches the
+     * {@code --auth} file's credentials to every request server-side, so the user never authenticates
+     * in the UI.
+     * <p>
+     * When {@code upstreamUrl} is null there is no {@code --auth} file — "try it out" is disabled in
+     * the UI — so the document is left untouched.
      */
     static ObjectNode makePlayable(ObjectNode doc, String proxyPath, String upstreamUrl) {
+        if (upstreamUrl == null) {
+            return doc;
+        }
         ArrayNode servers = arr();
         servers.add(obj().put("url", proxyPath).put("description", "proxied to " + upstreamUrl));
         doc.set("servers", servers);
-
-        ObjectNode components = doc.has("components") && doc.get("components").isObject()
-                ? (ObjectNode) doc.get("components") : obj();
-        ObjectNode schemes = components.has("securitySchemes")
-                && components.get("securitySchemes").isObject()
-                ? (ObjectNode) components.get("securitySchemes") : obj();
-        schemes.set("basicAuth", obj().put("type", "http").put("scheme", "basic"));
-        components.set("securitySchemes", schemes);
-        doc.set("components", components);
-
-        ArrayNode security = arr();
-        security.add(obj().set("basicAuth", arr()));
-        doc.set("security", security);
         return doc;
     }
 }

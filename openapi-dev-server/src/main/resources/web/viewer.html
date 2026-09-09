@@ -11,6 +11,13 @@
   re-initialising it in place leaves the previous document's schemas behind; a fresh frame is both
   simpler and cheaper than persuading it to forget.
 -->
+<script>
+  // Start the slice fetch immediately — before the ~1.5 MB swagger-ui bundle below even begins to
+  // download — so the two overlap instead of the spec waiting on the bundle to parse. The parsed
+  // object is handed straight to SwaggerUIBundle (as `spec`, not `url`), so the slice is fetched
+  // exactly once for the whole page: the shell no longer fetches it too.
+  window.__specText = fetch(new URLSearchParams(location.search).get('spec')).then(r => r.text());
+</script>
 <link rel="stylesheet" href="swagger-ui.css">
 <style>
   /* The shell already names the resource, so the frame does not repeat it. */
@@ -32,12 +39,29 @@
   // document this is the difference between a hundred DOM nodes and twenty thousand. Per resource
   // it is a handful of operations either way.
   var expand = params.get('expand') || 'list';
+  // "Try it out" is only offered when the server was started with --auth (see index.html /config.json).
+  // supportedSubmitMethods: [] removes the button for every operation; the default enables it. The
+  // shell passes tryit explicitly, so absence means off.
+  var tryItOut = params.get('tryit') === '1';
 
+  window.__specText.then(function (text) {
+    var doc = JSON.parse(text);
+    // The shell shows "<KB> · <n> schemas" for the slice; compute it here from the one fetch above
+    // and hand it back on completion, so the shell needs no fetch of its own.
+    var schemaCount = Object.keys((doc.components || {}).schemas || {}).length;
+    var sizeText = (text.length / 1024).toFixed(1) + ' KB · ' + schemaCount + ' schemas';
+    startRenderer(doc, sizeText);
+  });
+
+  function startRenderer(doc, sizeText) {
   window.ui = SwaggerUIBundle({
-    url: spec,
+    spec: doc,
     dom_id: '#swagger-ui',
     presets: [SwaggerUIBundle.presets.apis],
     layout: 'BaseLayout',
+    supportedSubmitMethods: tryItOut
+      ? ['get', 'put', 'post', 'delete', 'options', 'head', 'patch', 'trace']
+      : [],
     // The shell owns the URL; letting the renderer write location.hash too would fight it.
     deepLinking: false,
     // Per-resource documents are small enough to read whole, so the operation filter would only
@@ -49,12 +73,13 @@
     onComplete: function () {
       var loading = document.getElementById('loading');
       if (loading) { loading.remove(); }
-      // Tells the shell to stop its stopwatch. Same origin, so this is just a function call.
+      // Tells the shell to stop its stopwatch and report the size. Same origin, just a call.
       if (window.parent && window.parent.specRendered) {
-        window.parent.specRendered(spec);
+        window.parent.specRendered(spec, sizeText);
       }
     }
   });
+  }
 </script>
 </body>
 </html>

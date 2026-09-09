@@ -23,17 +23,24 @@ import java.util.concurrent.Executors;
  * and controller across every loaded module, each rendered from its own small document.
  *
  * <pre>
- * java -jar openapi-dev-server.jar --server=&lt;url&gt; [--port=9000] [--self-check] &lt;module-path&gt;...
+ * java -jar openapi-dev-server.jar [--auth=&lt;file&gt;] [--port=9000] [--self-check] &lt;module-path&gt;...
  * </pre>
+ *
+ * <h2>The {@code --auth} file</h2>
+ * A JSON file with {@code server}, {@code username} and {@code password} — e.g. {@code dev3.json}.
+ * When given, the UI's "try it out" is enabled and every proxied request is authenticated with the
+ * file's credentials server-side, so the user never types a password into the UI. When omitted, the
+ * docs render read-only: there is no upstream to proxy to and "try it out" is disabled.
  *
  * <h2>URL layout</h2>
  * <pre>
  * /                              the UI
+ * /config.json                   UI config — whether "try it out" is enabled
  * /index.json                    navigation index — every resource and controller, all modules
  * /slices/&lt;module&gt;/&lt;Name&gt;.json    one resource or controller as a self-contained document
  * /specs/&lt;module&gt;/openapi.json   a whole module, cross-module $refs resolved
  * /specs/all/openapi.json        every loaded module in one document
- * /proxy/*                       reverse proxy to --server, so "try it" avoids CORS
+ * /proxy/*                       reverse proxy to the --auth file's server, so "try it" avoids CORS
  * </pre>
  *
  * <h2>Structure</h2>
@@ -56,30 +63,42 @@ public class OpenApiDevServer {
 
     public static void main(String[] args) throws Exception {
         int port = DEFAULT_PORT;
-        String serverUrl = null;
+        String authFile = null;
         boolean selfCheck = false;
         List<String> modulePaths = new ArrayList<String>();
 
         for (String arg : args) {
             if (arg.startsWith("--port=")) {
                 port = Integer.parseInt(arg.substring("--port=".length()));
-            } else if (arg.startsWith("--server=")) {
-                serverUrl = arg.substring("--server=".length());
+            } else if (arg.startsWith("--auth=")) {
+                authFile = arg.substring("--auth=".length());
             } else if (arg.equals("--self-check")) {
                 selfCheck = true;
+            } else if (arg.startsWith("--server=")) {
+                // --server=<url> was removed: the server and its credentials now come from a JSON
+                // file. Say so explicitly, rather than letting the URL fall through to the module
+                // list and fail later with a misleading "no modules generated".
+                System.err.println("Error: --server=<url> was removed. "
+                    + "Use --auth=<file> instead, with a JSON file holding server/username/password "
+                    + "(see dev3.json).");
+                System.exit(1);
+            } else if (arg.startsWith("--")) {
+                System.err.println("Error: unknown option " + arg);
+                usageAndExit();
             } else {
                 modulePaths.add(arg);
             }
         }
 
-        if (modulePaths.isEmpty() || serverUrl == null) {
-            System.err.println("Usage: java -jar openapi-dev-server.jar --server=<url> "
-                + "[--port=9000] [--self-check] <module-path>...");
-            System.exit(1);
+        if (modulePaths.isEmpty()) {
+            usageAndExit();
         }
 
-        String upstreamUrl = serverUrl.endsWith("/")
-            ? serverUrl.substring(0, serverUrl.length() - 1) : serverUrl;
+        // Absent --auth is the read-only case: no upstream, no credentials, "try it out" off.
+        AuthConfig auth = authFile == null ? null : AuthConfig.load(authFile);
+        String upstreamUrl = auth == null ? null : auth.server;
+        String credentials = auth == null ? null : auth.basicAuthHeader();
+        boolean tryItOut = auth != null;
 
         SpecCatalog catalog = SpecCatalog.load(modulePaths);
         for (String module : catalog.modules()) {
@@ -102,12 +121,93 @@ public class OpenApiDevServer {
 
         HttpServer server = HttpServer.create(new InetSocketAddress(port), 0);
         server.setExecutor(Executors.newFixedThreadPool(8));
-        server.createContext("/", new Router(catalog, slicer, StaticAssets.locate(), upstreamUrl));
+        server.createContext("/",
+            new Router(catalog, slicer, StaticAssets.locate(), upstreamUrl, credentials, tryItOut));
         server.start();
 
         System.out.println();
         System.out.println("Serving OpenMRS API docs at http://localhost:" + port + "/");
-        System.out.println("Proxying API requests to " + upstreamUrl);
+        if (tryItOut) {
+            System.out.println("\"Try it out\" enabled — proxying authenticated API requests to "
+                + upstreamUrl);
+        } else {
+            System.out.println("Read-only: no --auth file, so \"try it out\" is disabled.");
+        }
+    }
+
+    private static void usageAndExit() {
+        System.err.println("Usage: java -jar openapi-dev-server.jar [--auth=<file>] "
+            + "[--port=9000] [--self-check] <module-path>...");
+        System.exit(1);
+    }
+
+    /**
+     * The {@code --auth} file: which OpenMRS instance to proxy to and the credentials to reach it.
+     * All three fields are required; a missing or blank one fails the run rather than serving docs
+     * whose "try it out" would silently 401.
+     */
+    static final class AuthConfig {
+
+        final String server;
+        final String username;
+        final String password;
+
+        private AuthConfig(String server, String username, String password) {
+            this.server = server;
+            this.username = username;
+            this.password = password;
+        }
+
+        static AuthConfig load(String path) {
+            com.fasterxml.jackson.databind.JsonNode root;
+            try {
+                root = Json.MAPPER.readTree(new java.io.File(path));
+            } catch (java.io.FileNotFoundException e) {
+                System.err.println("Error: --auth file not found: " + path);
+                System.exit(1);
+                return null;
+            } catch (IOException e) {
+                System.err.println("Error: could not parse --auth file " + path + " as JSON: "
+                    + e.getMessage());
+                System.exit(1);
+                return null;
+            }
+
+            List<String> missing = new ArrayList<String>();
+            String server = text(root, "server", missing);
+            String username = text(root, "username", missing);
+            String password = text(root, "password", missing);
+            if (!missing.isEmpty()) {
+                System.err.println("Error: --auth file " + path
+                    + " is missing required field(s): " + String.join(", ", missing)
+                    + ". It must be a JSON object with server, username and password.");
+                System.exit(1);
+            }
+
+            // The proxy computes upstreamUrl + requestPath, so a trailing slash would double up.
+            String normalized = server.endsWith("/")
+                ? server.substring(0, server.length() - 1) : server;
+            return new AuthConfig(normalized, username, password);
+        }
+
+        /** Null if the field is absent or blank (a blank credential is a likelier typo than intent). */
+        private static String text(com.fasterxml.jackson.databind.JsonNode root, String field,
+                List<String> missing) {
+            com.fasterxml.jackson.databind.JsonNode node = root.get(field);
+            String value = node != null && node.isTextual() ? node.asText().trim() : "";
+            if (value.isEmpty()) {
+                missing.add(field);
+                return null;
+            }
+            return value;
+        }
+
+        /** The {@code Authorization: Basic ...} header value the proxy attaches to every request. */
+        String basicAuthHeader() {
+            String token = java.util.Base64.getEncoder().encodeToString(
+                (username + ":" + password).getBytes(StandardCharsets.UTF_8));
+            return "Basic " + token;
+        }
     }
 
     static class Router implements HttpHandler {
@@ -115,20 +215,27 @@ public class OpenApiDevServer {
         private final SpecCatalog catalog;
         private final SpecSlicer slicer;
         private final StaticAssets assets;
-        private final RendererAssets renderer = new RendererAssets();
         private final String upstreamUrl;
+        /** {@code Authorization: Basic ...} attached to every proxied request; null with no --auth. */
+        private final String credentials;
+        private final boolean tryItOut;
         /** Built once — parsing the specs is the expensive half and that already happened. */
         private final byte[] index;
+        private final byte[] config;
         /** Whole-module and merged specs, serialised on first request. */
         private final Map<String, byte[]> fullSpecs =
             new java.util.concurrent.ConcurrentHashMap<String, byte[]>();
 
-        Router(SpecCatalog catalog, SpecSlicer slicer, StaticAssets assets, String upstreamUrl) {
+        Router(SpecCatalog catalog, SpecSlicer slicer, StaticAssets assets, String upstreamUrl,
+                String credentials, boolean tryItOut) {
             this.catalog = catalog;
             this.slicer = slicer;
             this.assets = assets;
             this.upstreamUrl = upstreamUrl;
+            this.credentials = credentials;
+            this.tryItOut = tryItOut;
             this.index = DocIndex.build(catalog);
+            this.config = Json.compact(Json.obj().put("tryItOut", tryItOut));
         }
 
         public void handle(HttpExchange exchange) throws IOException {
@@ -157,6 +264,10 @@ public class OpenApiDevServer {
 
             if (path.equals("/") || path.isEmpty()) {
                 serveAsset(exchange, "index.html");
+                return;
+            }
+            if (path.equals("/config.json")) {
+                sendBytes(exchange, 200, "application/json", config);
                 return;
             }
             if (path.equals("/index.json")) {
@@ -217,25 +328,28 @@ public class OpenApiDevServer {
         }
 
         private void serveAsset(HttpExchange exchange, String name) throws IOException {
-            if (RendererAssets.handles(name)) {
-                try {
-                    sendBytes(exchange, 200, StaticAssets.contentType(name), renderer.read(name));
-                } catch (IOException e) {
-                    send(exchange, 502, "text/plain; charset=utf-8",
-                        "Could not fetch the renderer bundle (" + name + "): " + e
-                            + "\nThe first run needs network access; after that it is cached.");
-                }
-                return;
-            }
             byte[] bytes = assets.read(name);
             if (bytes == null) {
                 send(exchange, 404, "text/plain; charset=utf-8", "Not found: " + name);
                 return;
             }
-            sendBytes(exchange, 200, StaticAssets.contentType(name), bytes);
+            // The pinned renderer files are large (~1.7 MB together) and a fresh iframe re-requests
+            // them on every resource click, yet never change for a given version — so cache them
+            // hard. That stops the re-download and lets the browser reuse the parsed bytecode click
+            // to click. Everything else is editable UI, kept no-store so a reload picks up edits.
+            String cacheControl = RendererAssets.handles(name)
+                ? "public, max-age=31536000, immutable" : "no-store";
+            sendBytes(exchange, 200, StaticAssets.contentType(name), bytes, cacheControl);
         }
 
         private void proxy(HttpExchange exchange, String upstreamPath) throws IOException {
+            if (upstreamUrl == null) {
+                send(exchange, 503, "text/plain; charset=utf-8",
+                    "No upstream configured: start the server with --auth=<file> to enable "
+                        + "\"try it out\".");
+                return;
+            }
+
             String query = exchange.getRequestURI().getRawQuery();
             String target = upstreamUrl + upstreamPath + (query != null ? "?" + query : "");
             System.out.println("[proxy] " + exchange.getRequestMethod() + " " + target);
@@ -248,6 +362,9 @@ public class OpenApiDevServer {
                     connection.setRequestProperty(header.getKey(), header.getValue().get(0));
                 }
             }
+            // Set after the copy loop so it wins: the credentials come from the --auth file, and the
+            // browser sends none (the spec declares no security scheme), so this is the only source.
+            connection.setRequestProperty("Authorization", credentials);
 
             String method = exchange.getRequestMethod().toUpperCase();
             if (method.equals("POST") || method.equals("PUT") || method.equals("PATCH")) {
@@ -291,11 +408,17 @@ public class OpenApiDevServer {
 
         private void sendBytes(HttpExchange exchange, int status, String contentType, byte[] bytes)
                 throws IOException {
+            // Default: no-store. The specs, index and slices are cheap to reserve and are
+            // regenerated out from under a running server, so caching them would mostly hide a
+            // regenerate. The one exception is the renderer bundle — see serveAsset.
+            sendBytes(exchange, status, contentType, bytes, "no-store");
+        }
+
+        private void sendBytes(HttpExchange exchange, int status, String contentType, byte[] bytes,
+                String cacheControl) throws IOException {
             exchange.getResponseHeaders().set("Content-Type", contentType);
             exchange.getResponseHeaders().set("Access-Control-Allow-Origin", "*");
-            // Everything served here is derived from files on disk that change under the server,
-            // so caching would mostly serve to hide a regenerate.
-            exchange.getResponseHeaders().set("Cache-Control", "no-store");
+            exchange.getResponseHeaders().set("Cache-Control", cacheControl);
             exchange.sendResponseHeaders(status, bytes.length);
             exchange.getResponseBody().write(bytes);
         }

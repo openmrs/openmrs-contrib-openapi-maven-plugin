@@ -92,9 +92,14 @@ customized [Swagger UI](https://swagger.io/open-source/swagger-ui/) frontend, wi
 large number of Resources and Controllers. The server also supports Swagger UI's "Try it out" feature, which allows the
 UI to send HTTP requests to a live OpenMRS server, by proxying its requests (to workaround CORS restrictions).
 
+Pass `--auth=<file>` to enable "Try it out". The file is a JSON object with `server`, `username` and
+`password` (see [`dev3.json`](dev3.json)); the server authenticates every proxied request with those
+credentials, so you never enter a password in the UI. Omit `--auth` for read-only docs, where "Try
+it out" is disabled.
+
 ```bash
 # Adjust the list of target modules as needed
-./serve.sh --server=https://dev3.openmrs.org/openmrs \
+./serve.sh --auth=dev3.json \
     ../openmrs-module-webservices.rest ../openmrs-module-queue \
     ../openmrs-module-appointments ../openmrs-module-emrapi
 ```
@@ -103,7 +108,7 @@ Then open <http://localhost:9000>.
 
 | Argument | |
 |---|---|
-| `--server=<url>` | **required** — base URL of the OpenMRS instance to proxy API calls to.. |
+| `--auth=<file>` | optional — JSON file with `server`, `username`, `password`. Enables "Try it out", authenticated with these credentials. `server` is the OpenMRS base URL, e.g. `https://dev3.openmrs.org/openmrs`. The script fails if any of the three fields is missing. |
 | `--port=<port>` | local port to listen on; defaults to `9000` |
 | `--self-check` | slice every resource before serving and report the totals, cross-module borrowing and any unresolved `$ref`; exits non-zero if anything dangles |
 | `<module-path>...` | one or more module roots that have already been generated |

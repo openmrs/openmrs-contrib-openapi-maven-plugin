@@ -1,0 +1,6 @@
+{
+    "_comment": "Example file to pass into the --auth param of server.sh for proxing requests into the specified server",
+    "server": "https://dev3.openmrs.org/openmrs",
+    "username": "admin",
+    "password": "Admin123"
+}

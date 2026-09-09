@@ -111,6 +111,9 @@ const bucketOf = (e) => e.k === 'controller' ? 'controller'
   : (e.sub ? 'subresource' : 'resource');
 
 let INDEX = [], BY_MODULE = new Map(), selected = null, renderStart = 0;
+// Whether the server was started with --auth, i.e. whether "try it out" can reach a live instance.
+// Fetched once below and passed down to each renderer frame; defaults off until then.
+let TRY_IT_OUT = false;
 // Collapsed by default: the point of the tree is that you see modules first, not 149 rows. A
 // search expands whatever it matched without disturbing what was opened by hand.
 const open = new Set();
@@ -378,21 +381,16 @@ function select(module, name) {
   const spec = `/slices/${encodeURIComponent(module)}/${encodeURIComponent(name)}.json`;
   el('meta').textContent = 'loading…';
   renderStart = performance.now();
-  el('frame').src = `viewer.html?spec=${encodeURIComponent(spec)}`;
-
-  fetch(spec).then(r => r.text()).then(text => {
-    const doc = JSON.parse(text);
-    const schemas = Object.keys((doc.components || {}).schemas || {}).length;
-    el('meta').dataset.size = `${(text.length / 1024).toFixed(1)} KB · ${schemas} schemas`;
-  });
+  // The frame fetches the slice once and reports its size back via specRendered — so the shell does
+  // not fetch it a second time just to show the KB/schema count.
+  el('frame').src = `viewer.html?spec=${encodeURIComponent(spec)}&tryit=${TRY_IT_OUT ? 1 : 0}`;
 }
 
 // Called by the frame when the renderer finishes, so the timing covers ingestion rather than just
 // the network fetch — ingestion is the part that costs, and the part slicing exists to bound.
-window.specRendered = function () {
+window.specRendered = function (spec, sizeText) {
   const ms = Math.round(performance.now() - renderStart);
-  const size = el('meta').dataset.size || '';
-  el('meta').textContent = size ? `${size} · ${ms} ms` : `${ms} ms`;
+  el('meta').textContent = sizeText ? `${sizeText} · ${ms} ms` : `${ms} ms`;
 };
 
 function fromHash() {
@@ -403,21 +401,30 @@ function fromHash() {
 }
 
 const t0 = performance.now();
-fetch('/index.json').then(r => r.text()).then(text => {
-  const tParse = performance.now();
-  INDEX = JSON.parse(text);
-  const parseMs = (performance.now() - tParse).toFixed(1);
-  for (const e of INDEX) {
-    if (!BY_MODULE.has(e.m)) { BY_MODULE.set(e.m, []); }
-    BY_MODULE.get(e.m).push(e);
-  }
-  render('');
-  el('stats').innerHTML +=
-    `<br>index ${(text.length / 1024).toFixed(0)} KB · parsed in ${parseMs} ms · ready in ${Math.round(performance.now() - t0)} ms`;
-  fromHash();
-}).catch(err => {
-  el('stats').textContent = 'Could not load the index: ' + err;
-});
+function loadIndex() {
+  fetch('/index.json').then(r => r.text()).then(text => {
+    const tParse = performance.now();
+    INDEX = JSON.parse(text);
+    const parseMs = (performance.now() - tParse).toFixed(1);
+    for (const e of INDEX) {
+      if (!BY_MODULE.has(e.m)) { BY_MODULE.set(e.m, []); }
+      BY_MODULE.get(e.m).push(e);
+    }
+    render('');
+    el('stats').innerHTML +=
+      `<br>index ${(text.length / 1024).toFixed(0)} KB · parsed in ${parseMs} ms · ready in ${Math.round(performance.now() - t0)} ms`;
+    fromHash();
+  }).catch(err => {
+    el('stats').textContent = 'Could not load the index: ' + err;
+  });
+}
+
+// Learn whether "try it out" is on before the index loads, so the first selection (which may come
+// straight from the URL hash) already carries the right flag. A failed fetch leaves it off.
+fetch('/config.json').then(r => r.json())
+  .then(cfg => { TRY_IT_OUT = !!cfg.tryItOut; })
+  .catch(() => {})
+  .then(loadIndex);
 
 window.addEventListener('hashchange', fromHash);
 el('q').addEventListener('input', e => render(e.target.value));
