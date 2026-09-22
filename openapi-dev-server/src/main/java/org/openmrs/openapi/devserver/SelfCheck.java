@@ -28,6 +28,7 @@ final class SelfCheck {
         int totalBytes = 0;
         int subResources = 0;
         int searchHandlers = 0;
+        int subclasses = 0;
         int operations = 0;
         int slicesBorrowing = 0;
         int borrowedTotal = 0;
@@ -42,6 +43,8 @@ final class SelfCheck {
                 allFields.addAll(entry.fields);
                 if ("searchhandler".equals(entry.kind)) {
                     searchHandlers++;
+                } else if ("subclass".equals(entry.kind)) {
+                    subclasses++;
                 } else if (entry.parent != null) {
                     subResources++;
                 }
@@ -77,7 +80,7 @@ final class SelfCheck {
         System.out.println("=== self-check ===");
         System.out.println("  index:     " + catalog.modules().size() + " modules, " + entryCount
             + " resources/controllers (" + subResources + " sub-resources, " + searchHandlers
-            + " search handlers), " + operations
+            + " search handlers, " + subclasses + " subclasses), " + operations
             + " operations, " + allFields.size() + " distinct field names — "
             + DocIndex.build(catalog).length / 1024 + " KB");
         System.out.println("  slices:    " + sliced + " documents, " + totalBytes / 1024

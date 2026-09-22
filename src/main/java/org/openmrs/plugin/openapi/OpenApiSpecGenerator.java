@@ -149,6 +149,7 @@ public class OpenApiSpecGenerator {
         clearGeneratedJson(schemaDir);
         clearGeneratedJson(Paths.get(outputDir, "controllers"));
         clearGeneratedJson(Paths.get(outputDir, "searchHandlers"));
+        clearGeneratedJson(Paths.get(outputDir, "subclasses"));
 
         // Json31, not Json: the spec is built as SpecVersion.V31 and the 3.0 writer silently drops
         // 3.1-only constructs (const, type arrays, examples) and stamps "openapi": "3.0.1".
@@ -221,6 +222,28 @@ public class OpenApiSpecGenerator {
                 e.printStackTrace();
             }
             System.out.println("Wrote schema file: " + outFile.toAbsolutePath());
+
+            // A subtype's schemas live inside the parent resource's file above, but the dev server
+            // discovers navigable entries by directory. Emit one manifest per module-owned subclass
+            // handler into subclasses/, so a subclass shows up as a searchable (greyed, non-clickable)
+            // item under its resource. The file carries the parent's collection route segment, which
+            // the dev server resolves to the parent entry through its existing route machinery.
+            List<DelegatingSubclassHandler<?, ?>> bound = subclassHandlers.get(handler);
+            if (bound != null && !bound.isEmpty()) {
+                String parentSegment = OpenMRSResourceModelResolver.getBaseTypeName(handler);
+                Path subclassDir = Paths.get(outputDir, "subclasses");
+                for (DelegatingSubclassHandler<?, ?> subclassHandler : bound) {
+                    if (!ModuleOwnership.isOwned(subclassHandler.getClass(), ownedLocations)) {
+                        continue;
+                    }
+                    Class<?> subclass = subclassHandler.getSubclassHandled();
+                    if (subclass == null) {
+                        continue;
+                    }
+                    writeSubclassFile(subclassDir, subclass.getSimpleName(), parentSegment,
+                        selected, swaggerMapper);
+                }
+            }
 
             // Add all schemas for this resource directly into components/schemas so that
             // Renderers can resolve named $refs (QueueGet, QueueCreate, etc.) without
@@ -1001,6 +1024,48 @@ public class OpenApiSpecGenerator {
         try {
             Files.write(outFile, swaggerMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(root));
             System.out.println("Wrote search handler file: " + outFile.toAbsolutePath());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    /**
+     * Writes {@code subclasses/<Domain>.json}: a manifest of a subtype's own schemas (already
+     * generated inside the parent resource's file) plus the parent's collection route segment. The
+     * dev server reads this to list the subtype as a navigable entry under its resource; it has no
+     * paths of its own, so the parent link is carried explicitly rather than derived from routes.
+     * The file is named after the domain object ({@code DrugOrder}) — unique after version
+     * filtering, and the name the tree shows and searches on.
+     */
+    private static void writeSubclassFile(Path dir, String domainName, String parentSegment,
+            java.util.Map<String, Schema> allSchemas,
+            com.fasterxml.jackson.databind.ObjectMapper swaggerMapper) {
+        java.util.List<String> names = new java.util.ArrayList<>();
+        for (String name : allSchemas.keySet()) {
+            if (name.startsWith(domainName + "Get_") || name.equals(domainName + "Create")
+                    || name.equals(domainName + "Update")) {
+                names.add(name);
+            }
+        }
+        if (names.isEmpty()) {
+            return;
+        }
+        java.util.Collections.sort(names);
+        Components sub = new Components();
+        for (String name : names) {
+            sub.addSchemas(name, allSchemas.get(name));
+        }
+        com.fasterxml.jackson.databind.JsonNode componentsJson = swaggerMapper.valueToTree(sub);
+        com.fasterxml.jackson.databind.node.ObjectNode root = swaggerMapper.createObjectNode();
+        if (componentsJson.has("schemas")) {
+            root.set("schemas", componentsJson.get("schemas"));
+        }
+        root.put("x-openmrs-parent-resource", parentSegment);
+        try {
+            Files.createDirectories(dir);
+            Path outFile = dir.resolve(domainName + ".json");
+            Files.write(outFile, swaggerMapper.writerWithDefaultPrettyPrinter().writeValueAsBytes(root));
+            System.out.println("Wrote subclass file: " + outFile.toAbsolutePath());
         } catch (IOException e) {
             e.printStackTrace();
         }

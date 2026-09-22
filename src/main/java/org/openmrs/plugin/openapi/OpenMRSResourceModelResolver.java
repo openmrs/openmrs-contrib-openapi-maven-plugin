@@ -350,13 +350,22 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
 
     // kind ("Get_default", "Create", …) -> type name -> that type's schema
     Map<String, Map<String, Schema<?>>> byKind = new LinkedHashMap<>();
+    // type name -> subclass domain simple name, for the subtype schema naming rule. The base type
+    // has no entry: its schemas keep the resourceName + kind + "_" + typeName form to avoid
+    // colliding OrderGet_default_order with the union's own name OrderGet_default.
+    Map<String, String> domainByType = new LinkedHashMap<>();
     collectVariant(byKind, resourceName, getBaseTypeName(handler),
         resolveRepresentationSchemasForResource(type, context, chain));
     for (DelegatingSubclassHandler<?, ?> subclassHandler : subclassHandlers) {
       @SuppressWarnings({ "unchecked", "rawtypes" })
       OpenmrsResourceAnnotatedType<?> variantType = new OpenmrsResourceAnnotatedType(
           (DelegatingResourceHandler<?>) subclassHandler, null, resourceName);
-      collectVariant(byKind, resourceName, getSubclassTypeName(subclassHandler),
+      String subtypeName = getSubclassTypeName(subclassHandler);
+      Class<?> subclass = subclassHandler.getSubclassHandled();
+      if (subclass != null) {
+        domainByType.put(subtypeName, subclass.getSimpleName());
+      }
+      collectVariant(byKind, resourceName, subtypeName,
           resolveRepresentationSchemasForResource(variantType, context, chain));
     }
 
@@ -372,13 +381,17 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
       }
 
       if (variants.size() == 1) {
-        // Only one type describes this kind — nothing to union.
-        Schema<?> only = variants.values().iterator().next();
-        only.name(resourceName + kind);
+        // Only one type describes this kind — nothing to union. Normally that lone type is the
+        // base (OrderCreate), but guard the case where only a subclass produces it, so it still
+        // gets its domain name rather than the resource's.
+        Map.Entry<String, Schema<?>> single = variants.entrySet().iterator().next();
+        Schema<?> only = single.getValue();
+        String domain = domainByType.get(single.getKey());
+        only.name(domain != null ? domain + kind : resourceName + kind);
         ret.add(only);
         continue;
       }
-      ret.add(buildTypeUnion(resourceName, kind, variants, typeAlwaysPresent, context));
+      ret.add(buildTypeUnion(resourceName, kind, variants, domainByType, typeAlwaysPresent, context));
     }
     return ret;
   }
@@ -402,7 +415,8 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
    * the {@code <Resource>Get} anyOf built by {@link #resolve} lists only the unions.
    */
   private static Schema<?> buildTypeUnion(String resourceName, String kind,
-      Map<String, Schema<?>> variants, boolean typeAlwaysPresent, ModelConverterContext context) {
+      Map<String, Schema<?>> variants, Map<String, String> domainByType,
+      boolean typeAlwaysPresent, ModelConverterContext context) {
     ObjectSchema union = Schemas.object();
     union.name(resourceName + kind);
     union.setDescription("One of the " + resourceName + " subtypes, selected by '" + TYPE_PROPERTY + "'");
@@ -411,7 +425,11 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
     for (Map.Entry<String, Schema<?>> entry : variants.entrySet()) {
       String typeName = entry.getKey();
       Schema<?> variant = entry.getValue();
-      String variantName = resourceName + kind + "_" + typeName;
+      // Subtype schemas are named after the subclass domain object (DrugOrderGet_default); the base
+      // keeps resourceName + kind + "_" + typeName (OrderGet_default_order) so it does not collide
+      // with the union name. refTargetFor must stay in lock-step with this.
+      String domain = domainByType.get(typeName);
+      String variantName = domain != null ? domain + kind : resourceName + kind + "_" + typeName;
       variant.name(variantName);
       variant.addExtension("x-openmrs-type", typeName);
       context.defineModel(variantName, variant);
@@ -1138,9 +1156,10 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
       // The subtype is documented inside its parent's file, so the file name is the parent's —
       // and it must go through the same registry as the branch below. Deriving one and not the
       // other is how a DrugOrder-typed property ends up pointing at ./Order.json, a file that no
-      // longer exists: a dangling ref that nothing fails on.
+      // longer exists: a dangling ref that nothing fails on. The schema name uses the subclass
+      // domain simple name (DrugOrderGet_ref), which must stay in lock-step with buildTypeUnion.
       return new String[] { fileNameFor(parent),
-          parent + "Get_" + rep.getRepresentation() + "_" + variant };
+          rawClass.getSimpleName() + "Get_" + rep.getRepresentation() };
     }
 
     String resourceName = resourceNameFor(rawClass);
@@ -1240,6 +1259,13 @@ public class OpenMRSResourceModelResolver extends ModelResolver {
         if (subclass != null && !VARIANT_BY_SUBCLASS.containsKey(subclass)) {
           PARENT_BY_SUBCLASS.put(subclass, parent);
           VARIANT_BY_SUBCLASS.put(subclass, getSubclassTypeName(subclassHandler));
+          // A subtype schema is named <SubclassDomain>Get_<rep> (e.g. DrugOrderGet_ref), so
+          // ownerLocationForSchema — which splits at "Get_" and looks the prefix up here — must be
+          // able to trace that prefix back to the subclass handler's JAR. Without this the schema
+          // is silently dropped from cross-module TypeScript imports (a free-form stub instead of
+          // the real type), with no build failure.
+          HANDLER_CLASS_BY_RESOURCE_NAME.putIfAbsent(subclass.getSimpleName(),
+              subclassHandler.getClass());
         }
       }
     }

@@ -111,7 +111,7 @@ final class SpecCatalog {
     private List<ResourceEntry> readEntries(String module, File openApiDir) throws IOException {
         List<ResourceEntry> found = new ArrayList<ResourceEntry>();
         String[][] kinds = { { "resource", "resources" }, { "controller", "controllers" },
-            { "searchhandler", "searchHandlers" } };
+            { "searchhandler", "searchHandlers" }, { "subclass", "subclasses" } };
         for (String[] kind : kinds) {
             File folder = new File(openApiDir, kind[1]);
             File[] files = folder.listFiles((dir, name) -> name.endsWith(".json"));
@@ -156,8 +156,15 @@ final class SpecCatalog {
                     entry.fields.addAll(sorted);
                 }
 
-                entry.parent = "searchhandler".equals(kind[0])
-                    ? searchParentSegment(operations) : parentSegment(operations);
+                if ("subclass".equals(kind[0])) {
+                    // A subclass has no routes of its own; the plugin writes the parent's collection
+                    // route segment explicitly so resolveParents can link it to the resource entry.
+                    String segment = doc.path("x-openmrs-parent-resource").asText(null);
+                    entry.parent = (segment == null || segment.isEmpty()) ? null : segment;
+                } else {
+                    entry.parent = "searchhandler".equals(kind[0])
+                        ? searchParentSegment(operations) : parentSegment(operations);
+                }
                 found.add(entry);
             }
         }
@@ -249,8 +256,8 @@ final class SpecCatalog {
             }
         }
         if (unresolved > 0) {
-            warnings.add(unresolved + " sub-resource(s)/search handler(s) kept a raw parent segment "
-                + "(no loaded module serves that route)");
+            warnings.add(unresolved + " sub-resource(s)/search handler(s)/subclass(es) kept a raw "
+                + "parent segment (no loaded module serves that route)");
         }
     }
 

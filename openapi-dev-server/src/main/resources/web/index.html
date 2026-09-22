@@ -52,9 +52,18 @@
  .leaf { padding: 6px 14px 6px 46px; cursor: pointer; border-left: 3px solid transparent;
          display: flex; align-items: baseline; gap: 6px; }
  .leaf.nested { padding-left: 66px; }
- /* Non-collapsible label separating a resource's sub-resources from its search handlers. */
+ /* Non-collapsible label separating a resource's sub-resources / search handlers / subclasses. */
  .subhead { padding: 3px 14px 3px 58px; font-size: 9.5px; text-transform: uppercase;
             letter-spacing: .5px; color: var(--muted); user-select: none; }
+ /* A subclass: shown for navigation and search only. It is documented as part of its parent
+    resource's schema, so it has no page of its own — greyed and not clickable. */
+ .subleaf { padding: 6px 14px 6px 66px; display: flex; align-items: baseline; gap: 6px;
+            cursor: default; }
+ .subleaf .body { flex: 1; min-width: 0; }
+ .subleaf .name { font-size: 13px; color: var(--muted); font-weight: 400; }
+ .subleaf .why { font-size: 10.5px; color: #555; font-family: ui-monospace, monospace;
+                 margin-top: 2px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+ .subleaf .ops { font-size: 10.5px; color: var(--muted); }
  .leaf .body { flex: 1; min-width: 0; }
  .leaf .twist { width: 9px; font-size: 9px; color: var(--muted); flex: none; margin-left: -13px; }
  .leaf.context .name { color: var(--muted); font-weight: 400; }
@@ -103,11 +112,12 @@
 <script>
 const el = (id) => document.getElementById(id);
 
-// Four buckets. A search handler has its own kind; a sub-resource has no separate kind in the index
-// — the plugin documents it as a resource, because that is what it is — so those two split on the
-// presence of the derived parent link instead.
+// Five buckets. A search handler and a subclass each have their own kind; a sub-resource has no
+// separate kind in the index — the plugin documents it as a resource, because that is what it is —
+// so those split on the presence of the derived parent link instead.
 const bucketOf = (e) => e.k === 'controller' ? 'controller'
   : e.k === 'searchhandler' ? 'searchhandler'
+  : e.k === 'subclass' ? 'subclass'
   : (e.sub ? 'subresource' : 'resource');
 
 let INDEX = [], BY_MODULE = new Map(), selected = null, renderStart = 0;
@@ -207,6 +217,18 @@ function render(rawQuery) {
 
     const subHeaderHtml = (label) => `<div class="subhead">${label}</div>`;
 
+    // A subclass is greyed and deliberately NOT a .leaf, so it carries no click handler and no
+    // data-m/data-n — it cannot be selected, only searched and read in context under its parent.
+    const subLeafHtml = (row) => {
+      const { e, why } = row;
+      const detail = why
+        ? `<div class="why">${mark(why, q)}</div>`
+        : `<div class="ops">subtype · ${e.f.length} fields</div>`;
+      return `<div class="subleaf">
+                <div class="body"><div class="name">${mark(e.n, q)}</div>${detail}</div>
+              </div>`;
+    };
+
     const resources = byKind.get('resource') || [];
     const subs = byKind.get('subresource') || [];
     const searchHandlers = byKind.get('searchhandler') || [];
@@ -221,13 +243,19 @@ function render(rawQuery) {
     // Full children of every resource, taken from the whole module rather than only the search
     // matches — so a matched parent (searching "PatientResource") can be expanded to reveal its
     // sub-resources and search handlers even when none of THEM matched the query.
-    const fullKids = new Map();        // parent name -> [{e}] sub-resources
-    const fullSearchKids = new Map();  // parent name -> [{e}] in-module search handlers
+    const fullKids = new Map();          // parent name -> [{e}] sub-resources
+    const fullSearchKids = new Map();    // parent name -> [{e}] in-module search handlers
+    const fullSubclassKids = new Map();  // parent name -> [{e}] in-module subclasses
     for (const e of moduleEntries) {
       if (e.k === 'searchhandler') {
         if (e.sub && isResourceHere(e.sub)) {
           if (!fullSearchKids.has(e.sub)) { fullSearchKids.set(e.sub, []); }
           fullSearchKids.get(e.sub).push({ e, why: '' });
+        }
+      } else if (e.k === 'subclass') {
+        if (e.sub && isResourceHere(e.sub)) {
+          if (!fullSubclassKids.has(e.sub)) { fullSubclassKids.set(e.sub, []); }
+          fullSubclassKids.get(e.sub).push({ e, why: '' });
         }
       } else if (e.sub) {
         if (!fullKids.has(e.sub)) { fullKids.set(e.sub, []); }
@@ -241,6 +269,7 @@ function render(rawQuery) {
     const matchedChild = new Map();    // child name -> matched row {e, why, s}
     const matchedParents = new Set();  // parents with at least one matched child
     const orphanSearch = [];
+    const orphanSubclass = [];
     for (const row of subs) {
       matchedChild.set(row.e.n, row);
       if (row.e.sub) { matchedParents.add(row.e.sub); }
@@ -253,6 +282,16 @@ function render(rawQuery) {
         orphanSearch.push(row);
       }
     }
+    for (const row of (byKind.get('subclass') || [])) {
+      if (row.e.sub && isResourceHere(row.e.sub)) {
+        matchedChild.set(row.e.n, row);
+        matchedParents.add(row.e.sub);
+      } else {
+        // Unreachable today: a module owning a subclass handler re-documents the parent resource in
+        // its own output, so the parent is always in-module. Kept for symmetry with orphanSearch.
+        orphanSubclass.push(row);
+      }
+    }
 
     const parentRows = new Map(resources.map(r => [r.e.n, r]));
     for (const parentName of matchedParents) {
@@ -262,12 +301,14 @@ function render(rawQuery) {
     }
 
     const nestedSearchCount = searchHandlers.length - orphanSearch.length;
+    const nestedSubclassCount = (byKind.get('subclass') || []).length - orphanSubclass.length;
     if (parentRows.size) {
       const node = module + '/resources';
       const isOpen = q ? true : open.has(node);
+      const resourceCount = resources.length + subs.length + nestedSearchCount + nestedSubclassCount;
       html += `<div class="group kind" data-node="${esc(node)}">
                  <span class="caret">${isOpen ? '▾' : '▸'}</span>Resources
-                 <span class="count">${resources.length + subs.length + nestedSearchCount}</span></div>`;
+                 <span class="count">${resourceCount}</span></div>`;
       if (isOpen) {
         // A matched child carries its highlight; a child pulled in only to fill out an expanded
         // parent renders plain.
@@ -275,7 +316,8 @@ function render(rawQuery) {
         for (const row of [...parentRows.values()].sort(byName)) {
           const childSubs = (fullKids.get(row.e.n) || []).sort(byName);
           const childSearch = (fullSearchKids.get(row.e.n) || []).sort(byName);
-          const kidCount = childSubs.length + childSearch.length;
+          const childSubclass = (fullSubclassKids.get(row.e.n) || []).sort(byName);
+          const kidCount = childSubs.length + childSearch.length + childSubclass.length;
           const kidNode = module + '/r/' + row.e.n;
           // Auto-expand only when a child actually matched, so a matched parent still gets a twisty
           // but stays collapsed until clicked; the twisty itself reflects the full child count.
@@ -285,16 +327,21 @@ function render(rawQuery) {
             context: row.context, kidCount: kidCount || 0
           });
           if (kidsOpen) {
-            // Search handlers always get a label (they look like sub-resources otherwise); the
-            // sub-resource label appears only when search handlers are also shown, so the common
-            // subs-only resource keeps its plain, unlabelled look.
+            // Search handlers and subclasses always get a label (they look like sub-resources
+            // otherwise); the sub-resource label appears only when a sibling section is also shown,
+            // so the common subs-only resource keeps its plain, unlabelled look.
+            const hasSiblingSection = childSearch.length || childSubclass.length;
             if (childSubs.length) {
-              if (childSearch.length) { html += subHeaderHtml('Sub-resources'); }
+              if (hasSiblingSection) { html += subHeaderHtml('Sub-resources'); }
               html += childSubs.map(c => leafHtml(decorate(c), { nested: true })).join('');
             }
             if (childSearch.length) {
               html += subHeaderHtml('Search handlers');
               html += childSearch.map(c => leafHtml(decorate(c), { nested: true })).join('');
+            }
+            if (childSubclass.length) {
+              html += subHeaderHtml('Subclasses');
+              html += childSubclass.map(c => subLeafHtml(decorate(c))).join('');
             }
           }
         }
@@ -319,6 +366,18 @@ function render(rawQuery) {
                  <span class="caret">${isOpen ? '▾' : '▸'}</span>Search handlers
                  <span class="count">${orphanSearch.length}</span></div>`;
       if (isOpen) { html += orphanSearch.sort(byName).map(r => leafHtml(r, {})).join(''); }
+    }
+
+    // A subclass whose resource is documented by another module has no resource node to nest under,
+    // so it gets its own sibling category. Unreachable today (the owning module re-documents the
+    // parent), kept symmetric with the orphaned search handlers above.
+    if (orphanSubclass.length) {
+      const node = module + '/subclasses';
+      const isOpen = q ? true : open.has(node);
+      html += `<div class="group kind" data-node="${esc(node)}">
+                 <span class="caret">${isOpen ? '▾' : '▸'}</span>Subclasses
+                 <span class="count">${orphanSubclass.length}</span></div>`;
+      if (isOpen) { html += orphanSubclass.sort(byName).map(r => subLeafHtml(r)).join(''); }
     }
   }
 
